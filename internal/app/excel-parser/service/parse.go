@@ -210,9 +210,18 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 		}
 
 		// Use GPT to analyze header structure
-		prompt := "Analyze this Excel data and identify which row contains the actual table column headers and where the data starts. " +
-			"Look for rows with column names like 'Бренд', 'Артикул', 'Наименование', 'Цена', 'Остаток', etc. " +
-			"Ignore contact info, metadata, and empty rows.\n\nRows:\n"
+		prompt := "Analyze this Excel data and identify which row contains the actual table column headers and where the data starts.\n\n" +
+			"IMPORTANT RULES:\n" +
+			"1. Column headers are typically short, descriptive field names (like product codes, names, prices, quantities)\n" +
+			"2. Avoid rows that contain category names, section titles, or descriptive text that spans multiple cells\n" +
+			"3. If you see a row with long descriptive text followed by a row with short field-like names, choose the row with short field names\n" +
+			"4. Data rows contain actual values, not field names\n" +
+			"5. Skip any promotional text, contact information, or metadata\n\n" +
+			"Example patterns:\n" +
+			"- GOOD header row: 'Code | Name | Price | Stock'\n" +
+			"- BAD header row: 'Electronics and Computer Accessories for Modern Office'\n" +
+			"- GOOD data row: 'A123 | Laptop Dell | 1500.00 | 5'\n\n" +
+			"Rows:\n"
 
 		for i, text := range rowTexts {
 			prompt += fmt.Sprintf("Row %d: %s\n", i, text)
@@ -404,15 +413,38 @@ func buildResultWithIndices(grid [][]string, startRow, headerRows, actualHeaderR
 					if c < len(grid[r]) {
 						val := strings.TrimSpace(grid[r][c])
 						if val != "" {
-							// Check if this looks like a header (short, likely column name) vs data/category
-							// Skip very long values that are likely category names or data
-							if len(val) <= 50 && !strings.Contains(val, " ") {
+							// Check if this looks like a header vs category/data
+							// Skip very long values (likely category names) but allow normal headers with spaces
+							if len(val) <= 30 {
 								headerValue = val
 								break
 							}
 						}
 					}
 				}
+			}
+
+			// Dynamic header quality improvement: if we have a short/ambiguous header,
+			// look for better alternatives in the same column
+			if headerValue != "" && (len(headerValue) <= 4 || isNumericOrCurrency(headerValue)) {
+				bestAlternative := headerValue
+				bestScore := scoreHeaderQuality(headerValue)
+
+				// Search in all rows between header and data start for better alternatives
+				for r := actualHeaderRowIndex; r < actualDataStartIndex && r < len(grid); r++ {
+					if c < len(grid[r]) {
+						candidate := strings.TrimSpace(grid[r][c])
+						if candidate != "" && candidate != headerValue {
+							candidateScore := scoreHeaderQuality(candidate)
+							if candidateScore > bestScore {
+								bestAlternative = candidate
+								bestScore = candidateScore
+							}
+						}
+					}
+				}
+
+				headerValue = bestAlternative
 			}
 
 			header[c] = headerValue
@@ -466,4 +498,139 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// isLikelyAcronym checks if a string looks like an acronym (all caps, short)
+func isLikelyAcronym(s string) bool {
+	if len(s) <= 2 {
+		return false // Too short to be meaningful
+	}
+	if len(s) > 6 {
+		return false // Too long to be typical acronym
+	}
+	// Check if it's all uppercase letters
+	for _, r := range s {
+		if r < 'A' || r > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+// scoreHeaderQuality gives a quality score to a potential header string
+// Higher score means better header quality
+func scoreHeaderQuality(header string) int {
+	if header == "" {
+		return 0
+	}
+
+	score := 0
+
+	// Length scoring: prefer meaningful length headers
+	length := len(header)
+	if length >= 3 && length <= 15 {
+		score += 3 // Good length range for column names
+	} else if length > 15 && length <= 30 {
+		score += 1 // Acceptable but getting long
+	} else if length < 3 {
+		score -= 2 // Too short, likely abbreviation
+	} else {
+		score -= 4 // Too long, likely category/section name
+	}
+
+	// Content analysis
+	wordCount := len(strings.Fields(header))
+	if wordCount == 1 {
+		score += 2 // Single words are often good column names
+	} else if wordCount == 2 {
+		score += 1 // Two words can be good (like "Full Name")
+	} else if wordCount > 3 {
+		score -= 3 // Too many words, likely descriptive text
+	}
+
+	// Penalize pure numbers or currency symbols
+	if isNumericOrCurrency(header) {
+		score -= 5
+	}
+
+	// Penalize strings that look like sentences or descriptions
+	if strings.Contains(header, ".") || strings.Contains(header, ",") || strings.Contains(header, ":") {
+		score -= 3
+	}
+
+	// Bonus for typical column name patterns (not specific words, but patterns)
+	if looksLikeColumnName(header) {
+		score += 3
+	}
+
+	return score
+}
+
+// isNumericOrCurrency checks if string is purely numeric or currency-like
+func isNumericOrCurrency(s string) bool {
+	if s == "" {
+		return false
+	}
+
+	// Check for pure numbers
+	if _, err := strconv.ParseFloat(s, 64); err == nil {
+		return true
+	}
+
+	// Check for common currency patterns (3-4 letter codes)
+	s = strings.ToUpper(strings.TrimSpace(s))
+	if len(s) == 3 || len(s) == 4 {
+		// Check if it's all letters (likely currency code)
+		allLetters := true
+		for _, r := range s {
+			if r < 'A' || r > 'Z' {
+				allLetters = false
+				break
+			}
+		}
+		if allLetters {
+			return true
+		}
+	}
+
+	// Check for currency symbols
+	currencySymbols := []string{"$", "€", "₽", "¥", "£"}
+	for _, symbol := range currencySymbols {
+		if strings.Contains(s, symbol) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// looksLikeColumnName uses pattern analysis to detect column-like names
+func looksLikeColumnName(s string) bool {
+	if s == "" {
+		return false
+	}
+
+	// Pattern 1: Single word that's not too long
+	words := strings.Fields(s)
+	if len(words) == 1 && len(s) >= 2 && len(s) <= 12 {
+		return true
+	}
+
+	// Pattern 2: Two short words (like "First Name", "Item Code")
+	if len(words) == 2 {
+		word1, word2 := words[0], words[1]
+		if len(word1) <= 8 && len(word2) <= 8 {
+			return true
+		}
+	}
+
+	// Pattern 3: Contains common column suffixes/prefixes
+	lower := strings.ToLower(s)
+	if strings.HasSuffix(lower, "id") || strings.HasSuffix(lower, "code") ||
+		strings.HasSuffix(lower, "name") || strings.HasSuffix(lower, "number") ||
+		strings.HasPrefix(lower, "num") || strings.HasPrefix(lower, "qty") {
+		return true
+	}
+
+	return false
 }
