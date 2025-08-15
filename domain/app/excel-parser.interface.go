@@ -11,5 +11,5 @@ type ParseExcelResult struct {
 }
 
 type ExcelParserService interface {
-	Parse(ctx nova_ctx.Ctx, file []byte) (*ParseExcelResult, errs.Error)
+	Parse(ctx nova_ctx.Ctx, file []byte) ([]*ParseExcelResult, errs.Error)
 }

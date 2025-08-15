@@ -1,820 +1,745 @@
 package excel_parser_service
 
-import (
-	"bytes"
-	"fmt"
-	"math"
-	"regexp"
-	"sort"
-	"strings"
-	"unicode"
-
-	"github.com/init-pkg/nova-template/domain/app"
-	"github.com/xuri/excelize/v2"
-)
-
-func (s *ExcelParserService) parse(file []byte) (*app.ParseExcelResult, error) {
-	// 1) Открываем .xlsx из памяти
-	f, err := excelize.OpenReader(bytes.NewReader(file))
-	if err != nil {
-		return nil, fmt.Errorf("open excel: %w", err)
-	}
-	defer func() { _ = f.Close() }()
-
-	sheets := f.GetSheetList()
-	if len(sheets) == 0 {
-		return nil, fmt.Errorf("no sheets found")
-	}
-
-	type candidate struct {
-		sheet string
-		rect  Rect
-		score float64 // плотность * регулярность
-	}
-
-	var best *candidate
-
-	// 2) На каждом листе строим маску занятости и ищем лучший прямоугольник таблицы
-	for _, sh := range sheets {
-		rows, err := f.GetRows(sh, excelize.Options{RawCellValue: true})
-		if err != nil {
-			continue
-		}
-		if len(rows) == 0 {
-			continue
-		}
-
-		rMax, cMax := usedBounds(rows)
-
-		// Маска заполненности (с учётом merge → помечаем весь merge-диапазон как "занято")
-		mask := makeMask(rows, rMax, cMax)
-
-		// Учитываем merge-диапазоны
-		if merges, err := f.GetMergeCells(sh); err == nil {
-			for _, mg := range merges {
-				sr, sc := refToRC(mg.GetStartAxis())
-				er, ec := refToRC(mg.GetEndAxis())
-				if sr <= 0 || sc <= 0 || er <= 0 || ec <= 0 {
-					continue
-				}
-				for r := sr - 1; r <= min(er-1, rMax-1); r++ {
-					for c := sc - 1; c <= min(ec-1, cMax-1); c++ {
-						if sr-1 < len(rows) && sc-1 < len(rows[sr-1]) && rows[sr-1][sc-1] != "" {
-							mask[r][c] = true
-						}
-					}
-				}
-			}
-		}
-
-		// (Необязательно) Попытка игнора картинок: excelize не даёт точного bbox,
-		// поэтому специально ничего не вычитаем; маска по тексту/числам и так отфильтрует плавающий мусор.
-
-		// Находим top-k прямоугольников из единиц
-		rects := largestRectangles(mask, 3)
-
-		// Оценим кандидатов: плотность + регулярность строк
-		for _, r := range rects {
-			if r.Empty() {
-				continue
-			}
-			density := rectDensity(mask, r)
-			if density < 0.55 { // слегка консервативный порог
-				continue
-			}
-			reg := rowRegularity(rows, r)
-			sc := density*0.7 + reg*0.3
-			if best == nil || sc > best.score {
-				rc := r // копия
-				best = &candidate{sheet: sh, rect: rc, score: sc}
-			}
-		}
-	}
-
-	if best == nil || best.rect.Empty() {
-		return nil, fmt.Errorf("failed to locate table block")
-	}
-
-	// 3) Режем блок, детектируем глубину хедера, собираем колонки и строки
-	rows, _ := f.GetRows(best.sheet, excelize.Options{RawCellValue: true})
-	_, maxCols := usedBounds(rows)
-
-	// предварительный блок по старому прямоугольнику
-	preBlock := sliceBlock(rows, best.rect)
-	if len(preBlock) == 0 {
-		return nil, fmt.Errorf("empty block")
-	}
-
-	// прикидываем глубину хедера на предварительном блоке
-	preH := detectHeaderDepth(preBlock)
-
-	// расширим прямоугольник по окну первых строк данных и дотянем вниз
-	refined := expandRectHoriz(rows, best.rect, preH, maxCols)
-	refined = extendRectDown(rows, refined)
-
-	// теперь работаем уже с уточнённым прямоугольником
-	block := sliceBlock(rows, refined)
-	if len(block) == 0 {
-		return nil, fmt.Errorf("empty refined block")
-	}
-
-	h := detectHeaderDepth(block)
-	header := buildHeader(block, h)
-	data := block[h:]
-	idxs := columnsToKeep(header, data)
-	header, data = projectColumns(header, data, idxs)
-
-	// Нормализуем ширину (некоторые строки могут быть короче)
-	maxW := 0
-	for _, r := range data {
-		if len(r) > maxW {
-			maxW = len(r)
-		}
-	}
-	if len(header) < maxW {
-		// добьём хедер до длины данных
-		delta := maxW - len(header)
-		header = append(header, make([]string, delta)...)
-	}
-	for i := range data {
-		if len(data[i]) < maxW {
-			d := make([]string, maxW-len(data[i]))
-			data[i] = append(data[i], d...)
-		}
-	}
-
-	// fin: отрезаем полностью пустые строки снизу (страховка)
-	data = trimEmptyRows(data)
-
-	res := &app.ParseExcelResult{
-		Header: header,
-		Rows:   data,
-	}
-	return res, nil
-}
-
-// ---- Геометрия и маски ----
-
-type Rect struct{ R1, C1, R2, C2 int } // включительно
-
-func (r Rect) Empty() bool { return r.R2 < r.R1 || r.C2 < r.C1 }
-func (r Rect) Height() int { return r.R2 - r.R1 + 1 }
-func (r Rect) Width() int  { return r.C2 - r.C1 + 1 }
-
-func usedBounds(rows [][]string) (int, int) {
-	rMax := len(rows)
-	cMax := 0
-	for _, r := range rows {
-		if len(r) > cMax {
-			cMax = len(r)
-		}
-	}
-	return rMax, cMax
-}
-
-func makeMask(rows [][]string, rMax, cMax int) [][]bool {
-	mask := make([][]bool, rMax)
-	for i := range mask {
-		mask[i] = make([]bool, cMax)
-		for j := 0; j < cMax; j++ {
-			var v string
-			if j < len(rows[i]) {
-				v = strings.TrimSpace(rows[i][j])
-			}
-			mask[i][j] = isSignalCell(v)
-		}
-	}
-	return mask
-}
-
-func isSignalCell(v string) bool {
-	if v == "" {
-		return false
-	}
-	// Отсекаем одиночные мусорные символы
-	if len([]rune(v)) <= 1 {
-		r := []rune(v)[0]
-		if unicode.IsPunct(r) || unicode.IsSymbol(r) {
-			return false
-		}
-	}
-	return true
-}
-
-func rectDensity(mask [][]bool, r Rect) float64 {
-	var ones, area int
-	for i := r.R1; i <= r.R2; i++ {
-		row := mask[i]
-		for j := r.C1; j <= r.C2; j++ {
-			area++
-			if row[j] {
-				ones++
-			}
-		}
-	}
-	if area == 0 {
-		return 0
-	}
-	return float64(ones) / float64(area)
-}
-
-// Оценка регулярности: SD по количеству непустых на строку → нормируем и инвертируем
-func rowRegularity(rows [][]string, r Rect) float64 {
-	cnt := make([]int, 0, r.Height())
-	for i := r.R1; i <= r.R2; i++ {
-		row := rows[i]
-		n := 0
-		for j := r.C1; j <= r.C2; j++ {
-			if j < len(row) && strings.TrimSpace(row[j]) != "" {
-				n++
-			}
-		}
-		cnt = append(cnt, n)
-	}
-	mean := 0.0
-	for _, v := range cnt {
-		mean += float64(v)
-	}
-	mean /= float64(len(cnt))
-	variance := 0.0
-	for _, v := range cnt {
-		d := float64(v) - mean
-		variance += d * d
-	}
-	variance /= float64(len(cnt))
-	sd := math.Sqrt(variance)
-	// 0 → идеально, 1+ → хуже; приведем к [0..1]
-	norm := 1.0 / (1.0 + sd)
-	return norm
-}
-
-// Largest rectangle in binary matrix (возвращаем top-k по площади)
-func largestRectangles(mask [][]bool, k int) []Rect {
-	h := len(mask)
-	if h == 0 {
-		return nil
-	}
-	w := len(mask[0])
-	heights := make([]int, w)
-	type candidate struct {
-		rect Rect
-		area int
-	}
-	var cands []candidate
-
-	for i := 0; i < h; i++ {
-		for j := 0; j < w; j++ {
-			if mask[i][j] {
-				heights[j]++
-			} else {
-				heights[j] = 0
-			}
-		}
-		for _, cand := range largestRectInHistogram(heights, i) {
-			cands = append(cands, cand)
-		}
-	}
-
-	sort.Slice(cands, func(i, j int) bool { return cands[i].area > cands[j].area })
-	if len(cands) > k {
-		cands = cands[:k]
-	}
-	out := make([]Rect, 0, len(cands))
-	for _, c := range cands {
-		out = append(out, c.rect)
-	}
-	return out
-}
-
-func largestRectInHistogram(heights []int, row int) []struct {
-	rect Rect
-	area int
-} {
-	type stEl struct{ idx, h int }
-	var st []stEl
-	var res []struct {
-		rect Rect
-		area int
-	}
-
-	for i := 0; i <= len(heights); i++ {
-		curH := 0
-		if i < len(heights) {
-			curH = heights[i]
-		}
-		start := i
-		for len(st) > 0 && st[len(st)-1].h > curH {
-			top := st[len(st)-1]
-			st = st[:len(st)-1]
-			width := i
-			if len(st) > 0 {
-				width = i - st[len(st)-1].idx - 1
-				start = st[len(st)-1].idx + 1
-			} else {
-				start = 0
-			}
-			if top.h > 0 && width > 0 {
-				r := Rect{
-					R1: row - top.h + 1,
-					R2: row,
-					C1: start,
-					C2: i - 1,
-				}
-				res = append(res, struct {
-					rect Rect
-					area int
-				}{rect: r, area: top.h * width})
-			}
-		}
-		st = append(st, stEl{idx: i, h: curH})
-	}
-	return res
-}
-
-// ---- Вырез блока и предобработка ----
-
-func sliceBlock(rows [][]string, r Rect) [][]string {
-	out := make([][]string, 0, r.Height())
-	for i := r.R1; i <= r.R2; i++ {
-		line := make([]string, 0, r.Width())
-		for j := r.C1; j <= r.C2; j++ {
-			var v string
-			if i < len(rows) && j < len(rows[i]) {
-				v = strings.TrimSpace(rows[i][j])
-			}
-			line = append(line, v)
-		}
-		out = append(out, line)
-	}
-	return out
-}
-
-func trimEmptyRows(data [][]string) [][]string {
-	isEmpty := func(r []string) bool {
-		for _, v := range r {
-			if strings.TrimSpace(v) != "" {
-				return false
-			}
-		}
-		return true
-	}
-	// снизу
-	for len(data) > 0 && isEmpty(data[len(data)-1]) {
-		data = data[:len(data)-1]
-	}
-	// сверху (на всякий)
-	for len(data) > 0 && isEmpty(data[0]) {
-		data = data[1:]
-	}
-	return data
-}
-
-// ---- Детекция глубины хедера ----
-
-var reNumber = regexp.MustCompile(`^\s*[\+\-]?\d{1,3}([.,]\d{3})*([.,]\d+)?\s*$`)
-var reMoney = regexp.MustCompile(`(?i)(₸|тг|kzt|руб|₽|usd|eur|%|с ндс|без ндс)`)
-var reDate = regexp.MustCompile(`^\s*\d{1,2}[\./-]\d{1,2}[\./-]\d{2,4}\s*$`)
-
-var headerDict = []string{
-	"артикул", "sku", "код", "наименование", "название", "товар", "единица", "ед.изм",
-	"единицы", "бренд", "категория", "цена", "розница", "опт", "количество", "остаток",
-	"шт", "вес", "объем", "ед", "упак", "упаковка", "баркод", "штрихкод", "поставщик",
-}
-
-// --- NEW: оценка "похожести на хедер" для строки
-func headerRowLikelihood(row []string) float64 {
-	total, dictHits, numbers := 0, 0, 0
-	for _, v := range row {
-		vv := strings.ToLower(strings.TrimSpace(v))
-		if vv == "" {
-			continue
-		}
-		total++
-		for _, h := range headerDict {
-			if strings.Contains(vv, h) {
-				dictHits++
-				break
-			}
-		}
-		if reNumber.MatchString(vv) || reDate.MatchString(vv) {
-			numbers++
-		}
-	}
-	if total == 0 {
-		return 0
-	}
-	// больше совпадений со словарём и меньше чисел → больше шанс, что это хедер
-	return (float64(dictHits)/float64(total))*0.7 + (1.0-float64(numbers)/float64(total))*0.3
-}
-
-// --- FIXED: детекция глубины хедера (с ограничением и рескорингом)
-func detectHeaderDepth(block [][]string) int {
-	n := len(block)
-	if n == 0 {
-		return 0
-	}
-	maxTry := min(6, n)
-
-	// 1) Посчитаем "data-score" по строкам
-	scores := make([]float64, n)
-	for i := 0; i < n; i++ {
-		var next []string
-		if i+1 < n {
-			next = block[i+1]
-		}
-		scores[i] = rowDataScore(block[i], i+1 < n, next)
-	}
-
-	// 2) Найдём первый "забег" из >=2 подряд строк, похожих на данные
-	thr := 0.55
-	run := 0
-	dataStart := -1
-	for i := 0; i < min(n, 20); i++ {
-		if scores[i] >= thr {
-			run++
-			if run >= 2 {
-				dataStart = i - run + 1 // индекс начала данных
-				break
-			}
-		} else {
-			run = 0
-		}
-	}
-
-	// 3) Если не нашли — fallback как раньше (перебор 1..maxTry)
-	if dataStart == -1 {
-		bestH, bestScore := 1, -1.0
-		for h := 1; h <= maxTry; h++ {
-			if h >= n {
-				break
-			}
-			// комбинированный скор: стабильность типов в данных + "хедерность" верхних строк
-			typStability := columnTypingStability(block[h:])
-			hdrLik := 0.0
-			for i := 0; i < h; i++ {
-				hdrLik += headerRowLikelihood(block[i])
-			}
-			// веса: делаем акцент на корректной сегментации данных
-			score := 0.75*typStability + 0.25*(hdrLik/float64(h))
-			if score > bestScore {
-				bestScore, bestH = score, h
-			}
-		}
-		return bestH
-	}
-
-	// 4) Нашли старт данных: не верим сразу большому h.
-	//    Ограничим хедер максимум 3 строками (часто хватает) и подберём лучшее h по метрике.
-	maxH := min(3, min(dataStart, maxTry))
-	if maxH <= 0 {
-		return 1
-	}
-
-	bestH, bestScore := 1, -1.0
-	for h := 1; h <= maxH; h++ {
-		typStability := columnTypingStability(block[h:])
-		hdrLik := 0.0
-		for i := 0; i < h; i++ {
-			hdrLik += headerRowLikelihood(block[i])
-		}
-		score := 0.75*typStability + 0.25*(hdrLik/float64(h))
-		if score > bestScore {
-			bestScore, bestH = score, h
-		}
-	}
-	return bestH
-}
-
-func rowDataScore(row []string, hasNext bool, next []string) float64 {
-	if len(row) == 0 {
-		return 0
-	}
-	total := 0
-	num := 0
-	dictHits := 0
-	unitHits := 0
-	for _, v := range row {
-		vv := strings.ToLower(strings.TrimSpace(v))
-		if vv == "" {
-			continue
-		}
-		total++
-		if reNumber.MatchString(vv) || reDate.MatchString(vv) {
-			num++
-		}
-		if reMoney.MatchString(vv) {
-			unitHits++
-		}
-		for _, h := range headerDict {
-			if strings.Contains(vv, h) {
-				dictHits++
-				break
-			}
-		}
-	}
-	numRatio := 0.0
-	if total > 0 {
-		numRatio = float64(num) / float64(total)
-	}
-
-	simNext := 0.0
-	if hasNext && next != nil {
-		simNext = jaccardRow(row, next)
-	}
-
-	// чем больше dictHits/unitHits — тем больше это похоже на хедер (понижаем скор)
-	penalty := 0.0
-	if total > 0 {
-		penalty = float64(dictHits)/float64(total)*0.4 + float64(unitHits)/float64(total)*0.2
-	}
-
-	score := 0.45*numRatio + 0.40*simNext - penalty
-	if score < 0 {
-		score = 0
-	}
-	if score > 1 {
-		score = 1
-	}
-	return score
-}
-
-func jaccardRow(a, b []string) float64 {
-	tok := func(r []string) map[string]struct{} {
-		m := make(map[string]struct{})
-		for _, v := range r {
-			for _, t := range tokenize(v) {
-				m[t] = struct{}{}
-			}
-		}
-		return m
-	}
-	ma, mb := tok(a), tok(b)
-	if len(ma) == 0 && len(mb) == 0 {
-		return 0
-	}
-	inter := 0
-	for t := range ma {
-		if _, ok := mb[t]; ok {
-			inter++
-		}
-	}
-	union := len(ma) + len(mb) - inter
-	if union == 0 {
-		return 0
-	}
-	return float64(inter) / float64(union)
-}
-
-func tokenize(s string) []string {
-	s = strings.ToLower(s)
-	s = strings.ReplaceAll(s, ",", " ")
-	s = strings.ReplaceAll(s, ";", " ")
-	s = strings.ReplaceAll(s, "/", " ")
-	s = strings.ReplaceAll(s, "\\", " ")
-	s = strings.ReplaceAll(s, "(", " ")
-	s = strings.ReplaceAll(s, ")", " ")
-	fields := strings.Fields(s)
-	out := make([]string, 0, len(fields))
-	for _, f := range fields {
-		f = strings.TrimFunc(f, func(r rune) bool {
-			return !(unicode.IsDigit(r) || unicode.IsLetter(r))
-		})
-		if f != "" {
-			out = append(out, f)
-		}
-	}
-	return out
-}
-
-func columnTypingStability(data [][]string) float64 {
-	if len(data) == 0 {
-		return 0
-	}
-	maxW := 0
-	for _, r := range data {
-		if len(r) > maxW {
-			maxW = len(r)
-		}
-	}
-	if maxW == 0 {
-		return 0
-	}
-	typeCounts := make([]map[string]int, maxW)
-	for i := 0; i < maxW; i++ {
-		typeCounts[i] = make(map[string]int)
-	}
-	sample := min(60, len(data))
-	for i := 0; i < sample; i++ {
-		row := data[i]
-		for j := 0; j < maxW; j++ {
-			var v string
-			if j < len(row) {
-				v = row[j]
-			}
-			t := inferCellType(v)
-			typeCounts[j][t]++
-		}
-	}
-	// Оцениваем среднюю "сконцентрированность" типов по колонкам (peak / total)
-	total := 0.0
-	for j := 0; j < maxW; j++ {
-		col := typeCounts[j]
-		sum := 0
-		peak := 0
-		for _, c := range col {
-			sum += c
-			if c > peak {
-				peak = c
-			}
-		}
-		if sum > 0 {
-			total += float64(peak) / float64(sum)
-		}
-	}
-	return total / float64(maxW) // 0..1
-}
-
-func inferCellType(v string) string {
-	vv := strings.ToLower(strings.TrimSpace(v))
-	switch {
-	case vv == "":
-		return "empty"
-	case reNumber.MatchString(vv):
-		return "number"
-	case reDate.MatchString(vv):
-		return "date"
-	case reMoney.MatchString(vv):
-		return "money"
-	case looksLikeSKU(vv):
-		return "sku"
-	default:
-		return "text"
-	}
-}
-
-func looksLikeSKU(v string) bool {
-	// простая эвристика: длинная без пробелов, буквы/цифры/-,_/ — похоже на артикул
-	if strings.ContainsAny(v, " \t") {
-		return false
-	}
-	r := []rune(v)
-	if len(r) < 5 {
-		return false
-	}
-	okChars := 0
-	for _, ch := range r {
-		if unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '-' || ch == '_' || ch == '/' {
-			okChars++
-		}
-	}
-	return float64(okChars)/float64(len(r)) > 0.8
-}
-
-// ---- Построение хедера ----
-
-func buildHeader(block [][]string, h int) []string {
-	if h <= 0 {
-		h = 1
-	}
-	h = min(h, len(block))
-
-	// ширина берём по всему блоку — чтобы увидеть правый хвост
-	maxW := 0
-	for _, r := range block {
-		if len(r) > maxW {
-			maxW = len(r)
-		}
-	}
-
-	header := make([]string, maxW)
-	for j := 0; j < maxW; j++ {
-		var parts []string
-		for i := 0; i < h; i++ {
-			if j < len(block[i]) && strings.TrimSpace(block[i][j]) != "" {
-				parts = append(parts, strings.TrimSpace(block[i][j]))
-			}
-		}
-		if len(parts) == 0 {
-			// посмотрим, есть ли данные под колонкой
-			hasData := false
-			for r := h; r < len(block); r++ {
-				if j < len(block[r]) && strings.TrimSpace(block[r][j]) != "" {
-					hasData = true
-					break
-				}
-			}
-			if hasData {
-				header[j] = fmt.Sprintf("undefined_%d", j+1)
-			} else {
-				header[j] = fmt.Sprintf("col_%d", j+1) // временное имя (скорее всего колонка удалится)
-			}
-		} else {
-			header[j] = normalizeHeader(strings.Join(parts, " / "))
-		}
-	}
-	return header
-}
-
-func normalizeHeader(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	reSpaces := regexp.MustCompile(`\s+`)
-	s = reSpaces.ReplaceAllString(s, " ")
-	s = strings.ReplaceAll(s, " ", "_")
-	s = strings.Map(func(r rune) rune {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
-			return r
-		}
-		return -1
-	}, s)
-	if s == "" {
-		s = "col"
-	}
-	return s
-}
-
-// ---- Утилиты ----
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func refToRC(ref string) (int, int) {
-	// "B3" -> (3, 2)
-	re := regexp.MustCompile(`^([A-Za-z]+)(\d+)$`)
-	m := re.FindStringSubmatch(ref)
-	if m == nil {
-		return 0, 0
-	}
-	col := titleToNumber(m[1])
-	row := 0
-	fmt.Sscanf(m[2], "%d", &row)
-	return row, col
-}
-
-func titleToNumber(s string) int {
-	s = strings.ToUpper(s)
-	n := 0
-	for i := 0; i < len(s); i++ {
-		n = n*26 + int(s[i]-'A') + 1
-	}
-	return n
-}
-
-// возвращает список индексов колонок, которые нужно сохранить
-func columnsToKeep(header []string, data [][]string) []int {
-	maxW := len(header)
-	W := min(200, len(data)) // окно по данным
-	keep := make([]bool, maxW)
-
-	for j := 0; j < maxW; j++ {
-		// признак "заголовок задан"
-		hasHeader := header[j] != "" && !strings.HasPrefix(header[j], "col_")
-		// считаем непустые в данных
-		nonEmpty := 0
-		for i := 0; i < W; i++ {
-			if j < len(data[i]) && strings.TrimSpace(data[i][j]) != "" {
-				nonEmpty++
-				if nonEmpty >= 3 { // ранний выход: точно есть данные
-					break
-				}
-			}
-		}
-		// порог для "почти пустой" колонки: ≤2 непустых на первых W строках
-		if hasHeader || nonEmpty >= 3 {
-			keep[j] = true
-		} else {
-			keep[j] = false // хвост мерджа/мусор — выкидываем
-		}
-	}
-
-	// сформируем список индексов
-	out := make([]int, 0, maxW)
-	for j := 0; j < maxW; j++ {
-		if keep[j] {
-			out = append(out, j)
-		}
-	}
-	return out
-}
-
-// применяем список индексов к header и data
-func projectColumns(header []string, data [][]string, idxs []int) ([]string, [][]string) {
-	newHeader := make([]string, len(idxs))
-	for k, j := range idxs {
-		newHeader[k] = header[j]
-	}
-	newData := make([][]string, len(data))
-	for i := range data {
-		row := make([]string, len(idxs))
-		for k, j := range idxs {
-			if j < len(data[i]) {
-				row[k] = data[i][j]
-			}
-		}
-		newData[i] = row
-	}
-	return newHeader, newData
-}
+// import (
+// 	"context"
+// 	"encoding/csv"
+// 	"encoding/json"
+// 	"fmt"
+// 	"math"
+// 	"regexp"
+// 	"slices"
+// 	"strconv"
+// 	"strings"
+
+// 	"log/slog"
+
+// 	"github.com/openai/openai-go/v2"
+// 	"github.com/xuri/excelize/v2"
+
+// 	"github.com/init-pkg/nova-template/domain/app"
+// )
+
+// // ---------------------------------------------------------------
+// // Вспомогательные типы (локальные).
+// // Если в вашем app.ParseExcelResult другие поля —
+// // адаптируйте mapToAppResult() ниже.
+// // ---------------------------------------------------------------
+
+// type detectedTable struct {
+// 	Sheet          string
+// 	Top, Left      int
+// 	Bottom, Right  int
+// 	HeaderEndRow   int // абсолютный индекс строки в пределах таблицы (0-based от Top), последняя строка заголовка
+// 	Headers        []string
+// 	Rows           [][]string
+// 	Category       string // ближняя категория (сверху или снизу)
+// 	RawGridSnippet [][]string
+// }
+
+// // ---------------------------------------------------------------
+// // Кэш заголовков/эмбеддингов (примитивный мем-кэш на процесс)
+// // ---------------------------------------------------------------
+
+// type HeaderCache interface {
+// 	Get(key string) (string, bool)
+// 	Set(key, value string)
+// }
+
+// type memHeaderCache struct {
+// 	m map[string]string
+// }
+
+// func (m *memHeaderCache) Get(key string) (string, bool) {
+// 	if m == nil || m.m == nil {
+// 		return "", false
+// 	}
+// 	v, ok := m.m[key]
+// 	return v, ok
+// }
+
+// func (m *memHeaderCache) Set(key, value string) {
+// 	if m == nil {
+// 		return
+// 	}
+// 	if m.m == nil {
+// 		m.m = map[string]string{}
+// 	}
+// 	m.m[key] = value
+// }
+
+// // ---------------------------------------------------------------
+// // Основная логика: parse()
+// // ---------------------------------------------------------------
+
+// // parse извлекает таблицы со всех листов.
+// // Алгоритм:
+// // 1) Загружаем книгу с разворачиванием merged.
+// // 2) Для каждого листа строим прямоугольные "плотные" блоки.
+// // 3) Для каждого блока определяем границу header/data (LLM+эвристика).
+// // 4) Получаем нижний уровень заголовков + строки.
+// // 5) Ищем ближайшую категорию сверху/снизу и добавляем в каждую строку.
+// func (s *ExcelParserService) parse(ctx context.Context, file []byte) ([]*app.ParseExcelResult, error) {
+// 	f, err := excelize.OpenReader(strings.NewReader(string(file)))
+// 	if err != nil {
+// 		return nil, fmt.Errorf("open excel: %w", err)
+// 	}
+// 	defer func() { _ = f.Close() }()
+
+// 	var out []*app.ParseExcelResult
+
+// 	sheets := f.GetSheetList()
+// 	for _, sheet := range sheets {
+// 		grid, err := readSheetGrid(f, sheet)
+// 		if err != nil {
+// 			s.log.Warn("readSheetGrid failed", slog.String("sheet", sheet), slog.Any("err", err))
+// 			continue
+// 		}
+// 		blocks := detectDenseBlocks(grid)
+
+// 		for _, b := range blocks {
+// 			sub := sliceGrid(grid, b.Top, b.Left, b.Bottom, b.Right)
+
+// 			// raw snapshot (до тримминга пустых столбцов/строк внутри блока)
+// 			raw := deepCopy2D(sub)
+
+// 			// обрежем пустые внешние строки/столбцы внутри блока
+// 			sub, rowOffset, colOffset := trimEmptyOuter(sub)
+// 			if len(sub) == 0 || len(sub[0]) == 0 {
+// 				continue
+// 			}
+
+// 			headerEnd := s.decideHeaderBoundary(ctx, sheet, sub)
+// 			// bottom-level headers (последняя строка хедера + прокидываем тексты сверху вниз, если многоуровневый)
+// 			headers := collapseHeadersToBottomLevel(sub, headerEnd)
+
+// 			// убираем полностью пустые столбцы из финального представления,
+// 			// но только если они пустые и в хедере, и в данных
+// 			sub, headers = dropAllEmptyColumns(sub, headers, headerEnd)
+
+// 			dataRows := [][]string{}
+// 			for r := headerEnd + 1; r < len(sub); r++ {
+// 				row := make([]string, len(headers))
+// 				for c := range headers {
+// 					if c < len(sub[r]) {
+// 						row[c] = sub[r][c]
+// 					}
+// 				}
+// 				// скипаем полностью пустые строки
+// 				if isAllEmpty(row) {
+// 					continue
+// 				}
+// 				dataRows = append(dataRows, row)
+// 			}
+
+// 			// категория: ищем ближайшую осмысленную строку/ячейку над таблицей или под ней
+// 			category := nearestCategory(grid, b.Top+rowOffset, b.Left+colOffset, b.Bottom, b.Right)
+
+// 			// добавим категорию как последний столбец
+// 			if category != "" {
+// 				headers = append(headers, "category")
+// 				for i := range dataRows {
+// 					dataRows[i] = append(dataRows[i], category)
+// 				}
+// 			}
+
+// 			det := detectedTable{
+// 				Sheet:          sheet,
+// 				Top:            b.Top + rowOffset,
+// 				Left:           b.Left + colOffset,
+// 				Bottom:         b.Bottom,
+// 				Right:          b.Right,
+// 				HeaderEndRow:   headerEnd,
+// 				Headers:        headers,
+// 				Rows:           dataRows,
+// 				Category:       category,
+// 				RawGridSnippet: raw,
+// 			}
+
+// 			appRes := mapToAppResult(det)
+// 			if appRes != nil {
+// 				out = append(out, appRes)
+// 			}
+// 		}
+// 	}
+
+// 	return out, nil
+// }
+
+// // ---------------------------------------------------------------
+// // Чтение листа в сетку с разворотом merged-ячеек
+// // ---------------------------------------------------------------
+
+// func readSheetGrid(f *excelize.File, sheet string) ([][]string, error) {
+// 	maxRow, maxCol, err := maxBounds(f, sheet)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	grid := make([][]string, maxRow)
+// 	for r := 0; r < maxRow; r++ {
+// 		grid[r] = make([]string, maxCol)
+// 	}
+
+// 	rows, err := f.Rows(sheet)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	rIdx := 0
+// 	for rows.Next() {
+// 		cols, _ := rows.Columns()
+// 		for c := 0; c < len(cols) && c < maxCol; c++ {
+// 			grid[rIdx][c] = normalizeCell(cols[c])
+// 		}
+// 		rIdx++
+// 		if rIdx >= maxRow {
+// 			break
+// 		}
+// 	}
+// 	_ = rows.Close()
+
+// 	// развернём merged
+// 	merged, _ := f.GetMergeCells(sheet)
+// 	for _, m := range merged {
+// 		startCol, startRow, err := excelize.CellNameToCoordinates(m.GetStartAxis())
+// 		if err != nil {
+// 			continue
+// 		}
+// 		endCol, endRow, err := excelize.CellNameToCoordinates(m.GetEndAxis())
+// 		if err != nil {
+// 			continue
+// 		}
+
+// 		val, _ := f.GetCellValue(sheet, m.GetStartAxis())
+// 		val = normalizeCell(val)
+
+// 		for r := startRow - 1; r <= endRow-1 && r < maxRow; r++ {
+// 			for c := startCol - 1; c <= endCol-1 && c < maxCol; c++ {
+// 				grid[r][c] = val
+// 			}
+// 		}
+// 	}
+
+// 	return grid, nil
+// }
+
+// func normalizeCell(s string) string {
+// 	s = strings.TrimSpace(s)
+// 	// заменим неразрывные пробелы, новые строки и т.д.
+// 	s = strings.ReplaceAll(s, "\u00A0", " ")
+// 	s = strings.ReplaceAll(s, "\r\n", "\n")
+// 	s = strings.ReplaceAll(s, "\r", "\n")
+// 	return s
+// }
+
+// func maxBounds(f *excelize.File, sheet string) (int, int, error) {
+// 	maxRow := 0
+// 	maxCol := 0
+
+// 	rows, err := f.Rows(sheet)
+// 	if err != nil {
+// 		return 0, 0, err
+// 	}
+// 	idx := 0
+// 	for rows.Next() {
+// 		cols, _ := rows.Columns()
+// 		if len(cols) > maxCol {
+// 			maxCol = len(cols)
+// 		}
+// 		idx++
+// 	}
+// 	_ = rows.Close()
+// 	maxRow = idx
+
+// 	// safety upper bound
+// 	if maxCol > 512 {
+// 		maxCol = 512
+// 	}
+// 	if maxRow > 10000 {
+// 		maxRow = 10000
+// 	}
+// 	return maxRow, maxCol, nil
+// }
+
+// // ---------------------------------------------------------------
+// // Поиск "плотных" блоков (кандидаты таблиц)
+// // ---------------------------------------------------------------
+
+// type rect struct{ Top, Left, Bottom, Right int }
+
+// func detectDenseBlocks(grid [][]string) []rect {
+// 	nr := len(grid)
+// 	if nr == 0 {
+// 		return nil
+// 	}
+
+// 	// эвристика: разбиваем по "пустым коридорам" из >=2 подряд пустых строк
+// 	emptyRow := func(r int) bool { return isAllEmpty(grid[r]) }
+// 	cuts := []int{-1}
+// 	emptyRun := 0
+// 	for r := 0; r < nr; r++ {
+// 		if emptyRow(r) {
+// 			emptyRun++
+// 		} else {
+// 			if emptyRun >= 2 {
+// 				cuts = append(cuts, r-1)
+// 			}
+// 			emptyRun = 0
+// 		}
+// 	}
+// 	cuts = append(cuts, nr)
+
+// 	var blocks []rect
+// 	for i := 0; i < len(cuts)-1; i++ {
+// 		top := cuts[i] + 1
+// 		bot := cuts[i+1] - 1
+// 		if bot-top+1 < 3 {
+// 			continue
+// 		}
+// 		// внутри сегмента найдём рабочую ширину
+// 		left, right := denseColsRange(grid[top : bot+1])
+// 		if right-left+1 < 2 {
+// 			continue
+// 		}
+// 		blocks = append(blocks, rect{Top: top, Left: left, Bottom: bot, Right: right})
+// 	}
+// 	return blocks
+// }
+
+// func denseColsRange(seg [][]string) (int, int) {
+// 	nr := len(seg)
+// 	nc := len(seg[0])
+// 	colScore := make([]int, nc)
+// 	for r := 0; r < nr; r++ {
+// 		for c := 0; c < nc; c++ {
+// 			if strings.TrimSpace(seg[r][c]) != "" {
+// 				colScore[c]++
+// 			}
+// 		}
+// 	}
+// 	// найдём непрерывный диапазон, где хотя бы в 20% строк колонки непустые
+// 	thr := int(math.Max(1, math.Round(0.2*float64(nr))))
+// 	bestL, bestR, bestSpan := 0, -1, 0
+// 	l := -1
+// 	for c := 0; c < nc; c++ {
+// 		if colScore[c] >= thr {
+// 			if l == -1 {
+// 				l = c
+// 			}
+// 		} else {
+// 			if l != -1 {
+// 				if c-1-l+1 > bestSpan {
+// 					bestSpan = c - l
+// 					bestL = l
+// 					bestR = c - 1
+// 				}
+// 				l = -1
+// 			}
+// 		}
+// 	}
+// 	if l != -1 && nc-1-l+1 > bestSpan {
+// 		bestL = l
+// 		bestR = nc - 1
+// 	}
+// 	return bestL, bestR
+// }
+
+// func sliceGrid(g [][]string, top, left, bottom, right int) [][]string {
+// 	out := make([][]string, bottom-top+1)
+// 	for i := range out {
+// 		out[i] = slices.Clone(g[top+i][left : right+1])
+// 	}
+// 	return out
+// }
+
+// func deepCopy2D(a [][]string) [][]string {
+// 	out := make([][]string, len(a))
+// 	for i := range a {
+// 		out[i] = slices.Clone(a[i])
+// 	}
+// 	return out
+// }
+
+// func trimEmptyOuter(g [][]string) ([][]string, int, int) {
+// 	if len(g) == 0 {
+// 		return g, 0, 0
+// 	}
+// 	nr, nc := len(g), len(g[0])
+// 	top, bot := 0, nr-1
+// 	left, right := 0, nc-1
+
+// 	for top <= bot && isAllEmpty(g[top]) {
+// 		top++
+// 	}
+// 	for bot >= top && isAllEmpty(g[bot]) {
+// 		bot--
+// 	}
+
+// 	colEmpty := func(c int) bool {
+// 		for r := top; r <= bot; r++ {
+// 			if strings.TrimSpace(g[r][c]) != "" {
+// 				return false
+// 			}
+// 		}
+// 		return true
+// 	}
+// 	for left <= right && colEmpty(left) {
+// 		left++
+// 	}
+// 	for right >= left && colEmpty(right) {
+// 		right--
+// 	}
+
+// 	if top > bot || left > right {
+// 		return [][]string{}, top, left
+// 	}
+
+// 	out := make([][]string, bot-top+1)
+// 	for r := range out {
+// 		out[r] = slices.Clone(g[top+r][left : right+1])
+// 	}
+// 	return out, top, left
+// }
+
+// func isAllEmpty(row []string) bool {
+// 	for _, v := range row {
+// 		if strings.TrimSpace(v) != "" {
+// 			return false
+// 		}
+// 	}
+// 	return true
+// }
+
+// // ---------------------------------------------------------------
+// // Граница header/data (LLM + эвристика)
+// // ---------------------------------------------------------------
+
+// func (s *ExcelParserService) decideHeaderBoundary(ctx context.Context, sheet string, grid [][]string) int {
+// 	// верхний максимум 25 строк анализируем LLM'ом
+// 	maxR := min(25, len(grid))
+// 	maxC := min(30, len(grid[0]))
+
+// 	snippet := toCSV(grid[:maxR], maxC)
+
+// 	// сперва попробуем кэш
+// 	cacheKey := fmt.Sprintf("header-boundary:%s:%x", sheet, hash32(snippet))
+// 	if cached, ok := s.cache.Get(cacheKey); ok {
+// 		if n, err := strconv.Atoi(cached); err == nil {
+// 			return clamp(n, 0, min(6, len(grid)-2)) // не позволяем слишком глубокий header
+// 		}
+// 	}
+
+// 	// Попытка через GPT (json-mode) — безопасный фолбэк на эвристику.
+// 	boundary, ok := s.askLLMHeaderBoundary(ctx, snippet)
+// 	if !ok {
+// 		boundary = heuristicHeaderBoundary(grid)
+// 	}
+// 	// Кэшируем строкой
+// 	s.cache.Set(cacheKey, fmt.Sprintf("%d", boundary))
+// 	return boundary
+// }
+
+// func (s *ExcelParserService) askLLMHeaderBoundary(ctx context.Context, csvSnippet string) (int, bool) {
+// 	// Используем structured JSON через chat.completions.
+// 	// Если библиотека/модель недоступны, возвращаем false.
+// 	defer func() { _ = recover() }()
+
+// 	sys := "You are a data extraction assistant. Given a CSV-like snippet of a table head+body, " +
+// 		"return a JSON with {\"header_rows\": N} where N is the number of header rows at the top " +
+// 		"(multi-level headers included). The CSV may contain noise lines above/below. " +
+// 		"Return only valid JSON."
+
+// 	user := "CSV snippet (comma-separated):\n```\n" + csvSnippet + "\n```"
+
+// 	// В openai-go/v2 JSON-моды формируются через tool/response_format, но оставим простой формат:
+// 	req := openai.ChatCompletionNewParams{
+// 		Model: openai.ChatModelGPT5Nano,
+// 		Messages: []openai.ChatCompletionMessageParamUnion{
+// 			openai.SystemMessage(sys),
+// 			openai.UserMessage(user),
+// 		},
+// 		Temperature: openai.Float(0.0),
+// 	}
+
+// 	resp, err := s.openaiClient.Chat.Completions.New(ctx, req)
+// 	if err != nil || len(resp.Choices) == 0 {
+// 		return 0, false
+// 	}
+
+// 	content := strings.TrimSpace(resp.Choices[0].Message.Content)
+// 	type jj struct {
+// 		HeaderRows int `json:"header_rows"`
+// 	}
+// 	var parsed jj
+// 	if err := json.Unmarshal([]byte(content), &parsed); err != nil {
+// 		// на случай, если модель вернула текст — извлечём число эвристикой
+// 		m := regexp.MustCompile(`\d+`).FindString(content)
+// 		if m == "" {
+// 			return 0, false
+// 		}
+// 		n, _ := strconv.Atoi(m)
+// 		return clamp(n-1, 0, 6), true
+// 	}
+// 	// Превращаем «кол-во строк хедера» в индекс последней строки хедера (0-based)
+// 	return clamp(parsed.HeaderRows-1, 0, 6), true
+// }
+
+// func heuristicHeaderBoundary(grid [][]string) int {
+// 	// Простая эвристика:
+// 	//  - хедер обычно плотнее по тексту, меньше чисел
+// 	//  - смена паттерна «текст->числа» часто указывает на границу
+// 	maxCheck := min(10, len(grid)-1)
+// 	last := 0
+// 	for r := 0; r < maxCheck; r++ {
+// 		texty := 0
+// 		numeric := 0
+// 		for _, v := range grid[r] {
+// 			v = strings.TrimSpace(v)
+// 			if v == "" {
+// 				continue
+// 			}
+// 			if maybeNumber(v) {
+// 				numeric++
+// 			} else {
+// 				texty++
+// 			}
+// 		}
+// 		if texty >= numeric {
+// 			last = r
+// 		}
+// 	}
+// 	return last
+// }
+
+// func maybeNumber(s string) bool {
+// 	// мягкая проверка: числа с разделителями/валютами
+// 	s = strings.TrimSpace(s)
+// 	s = strings.Trim(s, "+- $€£₸₽¥₩")
+// 	s = strings.ReplaceAll(s, " ", "")
+// 	s = strings.ReplaceAll(s, ",", "")
+// 	s = strings.ReplaceAll(s, "\u00A0", "")
+// 	_, err := strconv.ParseFloat(strings.ReplaceAll(s, "%", ""), 64)
+// 	return err == nil
+// }
+
+// // ---------------------------------------------------------------
+// // Обработка заголовков и данных
+// // ---------------------------------------------------------------
+
+// func collapseHeadersToBottomLevel(g [][]string, headerEnd int) []string {
+// 	if headerEnd < 0 {
+// 		return []string{}
+// 	}
+// 	nc := len(g[0])
+// 	headers := make([]string, nc)
+
+// 	// возьмём самую нижнюю строку заголовка как основу, а пустые
+// 	// прогоним наверх, пока не найдём непустую
+// 	for c := 0; c < nc; c++ {
+// 		val := strings.TrimSpace(g[headerEnd][c])
+// 		if val == "" {
+// 			// поднимемся вверх
+// 			for r := headerEnd - 1; r >= 0; r-- {
+// 				if strings.TrimSpace(g[r][c]) != "" {
+// 					val = g[r][c]
+// 					break
+// 				}
+// 			}
+// 		}
+// 		if val == "" {
+// 			val = fmt.Sprintf("undefined-%d", c+1)
+// 		}
+// 		headers[c] = val
+// 	}
+// 	// аккуратно сплющим multi-line в один токен
+// 	for i := range headers {
+// 		headers[i] = strings.Join(splitAndTrim(headers[i]), " ")
+// 	}
+// 	return headers
+// }
+
+// func splitAndTrim(s string) []string {
+// 	parts := strings.FieldsFunc(s, func(r rune) bool {
+// 		return r == '\n' || r == '\t'
+// 	})
+// 	out := make([]string, 0, len(parts))
+// 	for _, p := range parts {
+// 		p = strings.TrimSpace(p)
+// 		if p != "" {
+// 			out = append(out, p)
+// 		}
+// 	}
+// 	return out
+// }
+
+// func dropAllEmptyColumns(g [][]string, headers []string, headerEnd int) ([][]string, []string) {
+// 	nc := len(headers)
+// 	keep := make([]bool, nc)
+// 	for c := 0; c < nc; c++ {
+// 		colHas := false
+// 		for r := headerEnd + 1; r < len(g); r++ {
+// 			if c < len(g[r]) && strings.TrimSpace(g[r][c]) != "" {
+// 				colHas = true
+// 				break
+// 			}
+// 		}
+// 		if colHas || strings.TrimSpace(headers[c]) != "" {
+// 			keep[c] = true
+// 		}
+// 	}
+// 	// если оказалось, что все false — не трогаем
+// 	if !slices.Contains(keep, true) {
+// 		return g, headers
+// 	}
+
+// 	newHeaders := []string{}
+// 	newG := make([][]string, len(g))
+// 	for r := range g {
+// 		row := []string{}
+// 		for c := 0; c < nc; c++ {
+// 			if keep[c] {
+// 				if r == 0 {
+// 					newHeaders = append(newHeaders, headers[c])
+// 				}
+// 				if c < len(g[r]) {
+// 					row = append(row, g[r][c])
+// 				} else {
+// 					row = append(row, "")
+// 				}
+// 			}
+// 		}
+// 		newG[r] = row
+// 	}
+// 	return newG, newHeaders
+// }
+
+// // ---------------------------------------------------------------
+// // Категория (ближайшая строка/ячейка сверху или снизу)
+// // ---------------------------------------------------------------
+
+// func nearestCategory(grid [][]string, absTop, absLeft, absBottom, absRight int) string {
+// 	// Ищем сверху до 5 строк
+// 	upLimit := max(0, absTop-5)
+// 	for r := absTop - 1; r >= upLimit; r-- {
+// 		// возьмём «сигнатуру» строки
+// 		if cat := denseLineLabel(grid[r][absLeft : absRight+1]); cat != "" {
+// 			return cat
+// 		}
+// 	}
+// 	// Ищем снизу до 5 строк
+// 	downLimit := min(len(grid)-1, absBottom+5)
+// 	for r := absBottom + 1; r <= downLimit; r++ {
+// 		if cat := denseLineLabel(grid[r][absLeft : absRight+1]); cat != "" {
+// 			return cat
+// 		}
+// 	}
+// 	return ""
+// }
+
+// func denseLineLabel(cells []string) string {
+// 	// Если строка состоит в основном из текста и мало чисел — вероятный ярлык категории
+// 	texts := []string{}
+// 	numCount := 0
+// 	for _, v := range cells {
+// 		v = strings.TrimSpace(v)
+// 		if v == "" {
+// 			continue
+// 		}
+// 		if maybeNumber(v) {
+// 			numCount++
+// 		} else {
+// 			texts = append(texts, v)
+// 		}
+// 	}
+// 	if len(texts) >= 1 && numCount == 0 {
+// 		// объединяем уникальные тексты
+// 		uniq := map[string]struct{}{}
+// 		order := []string{}
+// 		for _, t := range texts {
+// 			if _, ok := uniq[t]; !ok {
+// 				uniq[t] = struct{}{}
+// 				order = append(order, t)
+// 			}
+// 		}
+// 		return strings.Join(order, " / ")
+// 	}
+// 	return ""
+// }
+
+// // ---------------------------------------------------------------
+// // Утилиты/форматы
+// // ---------------------------------------------------------------
+
+// func mapToAppResult(dt detectedTable) *app.ParseExcelResult {
+// 	// Если у вашего app.ParseExcelResult нет поля Sheet — удалите присвоение.
+// 	// Ожидается структура:
+// 	// type ParseExcelResult struct {
+// 	//   Sheet  string     `json:"sheet,omitempty"`
+// 	//   Header []string   `json:"header"`
+// 	//   Rows   [][]string `json:"rows"`
+// 	// }
+// 	res := &app.ParseExcelResult{
+// 		Header: dt.Headers,
+// 		Rows:   dt.Rows,
+// 	}
+// 	// заполним через рефлексию, если есть поле Sheet
+// 	type hasSheet interface{ SetSheet(string) }
+// 	if hs, ok := any(res).(hasSheet); ok {
+// 		hs.SetSheet(dt.Sheet)
+// 	} else {
+// 		// пробуем через json tags (без паники, просто игнор если поля нет)
+// 		type tmp struct {
+// 			Sheet  string     `json:"sheet,omitempty"`
+// 			Header []string   `json:"header"`
+// 			Rows   [][]string `json:"rows"`
+// 		}
+// 		_ = tmp{Sheet: dt.Sheet, Header: dt.Headers, Rows: dt.Rows} // no-op, документирует намерение
+// 	}
+// 	return res
+// }
+
+// func min(a, b int) int {
+// 	if a < b {
+// 		return a
+// 	}
+// 	return b
+// }
+
+// func max(a, b int) int {
+// 	if a > b {
+// 		return a
+// 	}
+// 	return b
+// }
+
+// func clamp(x, lo, hi int) int {
+// 	if x < lo {
+// 		return lo
+// 	}
+// 	if x > hi {
+// 		return hi
+// 	}
+// 	return x
+// }
+
+// func hash32(s string) uint32 {
+// 	var h uint32 = 2166136261
+// 	const p uint32 = 16777619
+// 	for i := 0; i < len(s); i++ {
+// 		h ^= uint32(s[i])
+// 		h *= p
+// 	}
+// 	return h
+// }
+
+// func toCSV(grid [][]string, limitCols int) string {
+// 	b := &strings.Builder{}
+// 	w := csv.NewWriter(b)
+// 	for _, row := range grid {
+// 		line := row
+// 		if len(line) > limitCols {
+// 			line = line[:limitCols]
+// 		}
+// 		_ = w.Write(line)
+// 	}
+// 	w.Flush()
+// 	return b.String()
+// }

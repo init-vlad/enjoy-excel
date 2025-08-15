@@ -8,7 +8,7 @@ import (
 )
 
 func TestApp(parseExcelService app.ExcelParserService) {
-	f, err := os.ReadFile("./resources/test-data/excel/STN.xlsx")
+	f, err := os.ReadFile("./resources/test-data/excel/abris-1.xlsx")
 	if err != nil {
 		panic(err)
 	}

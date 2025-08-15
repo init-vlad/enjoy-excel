@@ -1,41 +1,45 @@
 package excel_parser_service
 
-import (
-	"encoding/json"
-	"log/slog"
-	"os"
+// import (
+// 	"context"
+// 	"encoding/json"
+// 	"log/slog"
+// 	"os"
 
-	"github.com/init-pkg/nova-template/domain/app"
-	"github.com/init-pkg/nova/errs"
-	nova_ctx "github.com/init-pkg/nova/shared/ctx"
+// 	"github.com/init-pkg/nova-template/domain/app"
+// 	"github.com/init-pkg/nova/errs"
+// 	nova_ctx "github.com/init-pkg/nova/shared/ctx"
 
-	"github.com/openai/openai-go/v2"
-)
+// 	"github.com/openai/openai-go/v2"
+// )
 
-type ExcelParserService struct {
-	openaiClient *openai.Client
-	log          *slog.Logger
-	cache        HeaderCache
-}
+// // ---------------------------------------------------------------
+// // Service
+// // ---------------------------------------------------------------
 
-var _ app.ExcelParserService = &ExcelParserService{}
+// type ExcelParserService struct {
+// 	openaiClient *openai.Client
+// 	log          *slog.Logger
+// 	cache        HeaderCache
+// }
 
-func New(openaiClient *openai.Client, log *slog.Logger) *ExcelParserService {
+// var _ app.ExcelParserService = &ExcelParserService{}
 
-	return &ExcelParserService{openaiClient, log, &memHeaderCache{}}
-}
+// func New(openaiClient *openai.Client, log *slog.Logger) *ExcelParserService {
+// 	return &ExcelParserService{openaiClient, log, &memHeaderCache{}}
+// }
 
-func (this *ExcelParserService) Parse(ctx nova_ctx.Ctx, file []byte) (*app.ParseExcelResult, errs.Error) {
-	res, err := this.parse(file)
-	if err != nil {
-		return nil, errs.WrapAppError(err, &errs.ErrorOpts{})
-	}
+// // Parse теперь возвращает массив результатов по всем найденным таблицам.
+// func (s *ExcelParserService) Parse(ctx nova_ctx.Ctx, file []byte) ([]*app.ParseExcelResult, errs.Error) {
+// 	results, err := s.parse(context.Background(), file)
+// 	if err != nil {
+// 		return nil, errs.WrapAppError(err, &errs.ErrorOpts{})
+// 	}
 
-	js, err := json.Marshal(res)
-	if err != nil {
-		return nil, errs.WrapAppError(err, &errs.ErrorOpts{})
-	}
+// 	js, err2 := json.MarshalIndent(results, "", "  ")
+// 	if err2 == nil {
+// 		_ = os.WriteFile("parsed_result.json", js, 0644)
+// 	}
 
-	os.WriteFile("parsed_result.json", js, 0644)
-	return res, nil
-}
+// 	return results, nil
+// }
