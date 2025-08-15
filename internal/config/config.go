@@ -58,7 +58,11 @@ type MinioConfig struct {
 
 // Clients to external APIs, SDKs
 type Clients struct {
-	// Example: PaymentAPI, NotificationService, etc.
+	OpenAI OpenAIConfig `yaml:"openai"`
+}
+
+type OpenAIConfig struct {
+	ApiKey string `yaml:"api_key"`
 }
 
 // Internal microservices or internal modules
