@@ -1,7 +1,9 @@
 package excel_parser_service
 
 import (
+	"encoding/json"
 	"log/slog"
+	"os"
 
 	"github.com/init-pkg/nova-template/domain/app"
 	"github.com/init-pkg/nova/errs"
@@ -22,8 +24,17 @@ func New(openaiClient *openai.Client, log *slog.Logger) *ExcelParserService {
 	return &ExcelParserService{openaiClient, log}
 }
 
-func (s *ExcelParserService) Parse(ctx nova_ctx.Ctx, file []byte) (*app.ParseExcelResult, errs.Error) {
-	return nil, nil
-	// Implement the logic to parse Excel files here
-	// This is a placeholder implementatio
+func (this *ExcelParserService) Parse(ctx nova_ctx.Ctx, file []byte) (*app.ParseExcelResult, errs.Error) {
+	res, err := this.parse(file)
+	if err != nil {
+		return nil, errs.WrapAppError(err, &errs.ErrorOpts{})
+	}
+
+	js, err := json.Marshal(res)
+	if err != nil {
+		return nil, errs.WrapAppError(err, &errs.ErrorOpts{})
+	}
+
+	os.WriteFile("parsed_result.json", js, 0644)
+	return res, nil
 }
