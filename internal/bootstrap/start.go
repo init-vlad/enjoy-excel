@@ -8,6 +8,7 @@ func Run() {
 	app := fx.New(
 		coreOptions(),
 		appOptions(),
+		clientsOptions(),
 	)
 
 	app.Run()
