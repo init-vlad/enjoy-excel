@@ -24,6 +24,12 @@ type GPTAnalysisResponse struct {
 	Reasoning      string `json:"reasoning" jsonschema_description:"Brief explanation of the analysis and why these row indices were chosen"`
 }
 
+type GPTTableValidationResponse struct {
+	IsProductTable bool   `json:"is_product_table" jsonschema_description:"Whether this appears to be a product/goods table (has columns like артикул, цена, остаток, etc.)"`
+	Confidence     int    `json:"confidence" jsonschema_description:"Confidence level from 1-10, where 10 means definitely a product table"`
+	Reasoning      string `json:"reasoning" jsonschema_description:"Brief explanation of why this is or isn't a product table"`
+}
+
 func GenerateSchema[T any]() interface{} {
 	// Structured Outputs uses a subset of JSON schema
 	// These flags are necessary to comply with the subset
@@ -38,6 +44,7 @@ func GenerateSchema[T any]() interface{} {
 
 // Generate the JSON schema at initialization time
 var GPTAnalysisResponseSchema = GenerateSchema[GPTAnalysisResponse]()
+var GPTTableValidationResponseSchema = GenerateSchema[GPTTableValidationResponse]()
 
 type ExcelParserService struct {
 	openaiClient *openai.Client
@@ -58,6 +65,67 @@ func (this *ExcelParserService) Parse(ctx nova_ctx.Ctx, file []byte) ([]*app.Par
 	}
 
 	return res, nil
+}
+
+// isProductTable checks if the given table structure represents a product/goods table
+func (this *ExcelParserService) isProductTable(header []string, sampleRows [][]string) bool {
+	// Create a prompt with header and sample data
+	headerText := strings.Join(header, " | ")
+
+	prompt := "Analyze this table structure and determine if it represents a product/goods catalog table. " +
+		"Look for typical e-commerce/catalog columns like артикул, код, цена, остаток, наименование, описание, бренд, etc. " +
+		"Ignore contact information, navigation menus, or administrative tables.\n\n" +
+		"Header: " + headerText + "\n\n"
+
+	if len(sampleRows) > 0 {
+		prompt += "Sample data rows:\n"
+		for i, row := range sampleRows {
+			if i >= 3 { // Limit to first 3 rows
+				break
+			}
+			rowText := strings.Join(row, " | ")
+			prompt += fmt.Sprintf("Row %d: %s\n", i+1, rowText)
+		}
+	}
+
+	schemaParam := openai.ResponseFormatJSONSchemaJSONSchemaParam{
+		Name:        "table_validation_response",
+		Description: openai.String("Analysis of whether table represents product catalog"),
+		Schema:      GPTTableValidationResponseSchema,
+		Strict:      openai.Bool(true),
+	}
+
+	req := openai.ChatCompletionNewParams{
+		Model: openai.ChatModelGPT5Nano,
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.UserMessage(prompt),
+		},
+		ResponseFormat: openai.ChatCompletionNewParamsResponseFormatUnion{
+			OfJSONSchema: &openai.ResponseFormatJSONSchemaParam{
+				JSONSchema: schemaParam,
+			},
+		},
+	}
+
+	resp, err := this.openaiClient.Chat.Completions.New(context.Background(), req)
+	if err != nil {
+		this.log.Error("failed to validate table with GPT", "error", err)
+		return true // Default to true if validation fails
+	}
+
+	if len(resp.Choices) > 0 {
+		gptResponse := strings.TrimSpace(resp.Choices[0].Message.Content)
+		var validation GPTTableValidationResponse
+		if parseErr := json.Unmarshal([]byte(gptResponse), &validation); parseErr == nil {
+			this.log.Info("GPT table validation result",
+				"isProductTable", validation.IsProductTable,
+				"confidence", validation.Confidence,
+				"reasoning", validation.Reasoning)
+			return validation.IsProductTable && validation.Confidence >= 7
+		}
+	}
+
+	return true // Default to true if parsing fails
 }
 
 type HeaderCache interface {
@@ -125,7 +193,19 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 				headerRows = 1
 			}
 			result := buildResultWithIndices(grid, startRow, headerRows, -1, -1, maxCol)
-			results = append(results, result)
+
+			// Still validate even minimal tables
+			sampleRows := result.Rows
+			if len(sampleRows) > 3 {
+				sampleRows = sampleRows[:3]
+			}
+
+			if this.isProductTable(result.Header, sampleRows) {
+				this.log.Info("Minimal table validated as product table")
+				results = append(results, result)
+			} else {
+				this.log.Info("Minimal table rejected - not a product table", "header", result.Header)
+			}
 			continue
 		}
 
@@ -162,7 +242,19 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 			this.log.Error("failed to get GPT response", "error", err)
 			// Fallback to heuristic: assume 1-2 header rows
 			result := buildResultWithIndices(grid, startRow, 1, -1, -1, maxCol)
-			results = append(results, result)
+
+			// Still validate fallback tables
+			sampleRows := result.Rows
+			if len(sampleRows) > 3 {
+				sampleRows = sampleRows[:3]
+			}
+
+			if this.isProductTable(result.Header, sampleRows) {
+				this.log.Info("Fallback table validated as product table")
+				results = append(results, result)
+			} else {
+				this.log.Info("Fallback table rejected - not a product table", "header", result.Header)
+			}
 			continue
 		}
 
@@ -198,7 +290,29 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 
 		result := buildResultWithIndices(grid, startRow, headerRows, actualHeaderRowIndex, actualDataStartIndex, maxCol)
 
-		results = append(results, result)
+		// Log detailed information about the parsed table structure
+		this.log.Info("Parsed table structure",
+			"sheet", sheet,
+			"startRow", startRow,
+			"headerRows", headerRows,
+			"actualHeaderRowIndex", actualHeaderRowIndex,
+			"actualDataStartIndex", actualDataStartIndex,
+			"maxCol", maxCol,
+			"header", result.Header,
+			"rowCount", len(result.Rows))
+
+		// Check if this is a product table using GPT
+		sampleRows := result.Rows
+		if len(sampleRows) > 3 {
+			sampleRows = sampleRows[:3] // Limit to first 3 rows for analysis
+		}
+
+		if this.isProductTable(result.Header, sampleRows) {
+			this.log.Info("Table validated as product table", "sheet", sheet)
+			results = append(results, result)
+		} else {
+			this.log.Info("Table rejected - not a product table", "sheet", sheet, "header", result.Header)
+		}
 	}
 
 	this.log.Info("Excel parsing completed successfully", "sheetsProcessed", len(results))
@@ -225,7 +339,12 @@ func getFilledGrid(f *excelize.File, sheet string) ([][]string, int, error) {
 	for i := range grid {
 		grid[i] = make([]string, maxCol)
 		if len(rows[i]) > 0 {
-			copy(grid[i], rows[i])
+			// Apply trim to all cell values
+			for j, cell := range rows[i] {
+				if j < maxCol {
+					grid[i][j] = strings.TrimSpace(cell)
+				}
+			}
 		}
 	}
 
@@ -234,7 +353,7 @@ func getFilledGrid(f *excelize.File, sheet string) ([][]string, int, error) {
 		return nil, 0, err
 	}
 	for _, merge := range merges {
-		val := merge[0] // Value is first element
+		val := strings.TrimSpace(merge[0]) // Apply trim to merged cell values too
 		// Parse range
 		parts := strings.Split(merge[1], ":")
 		if len(parts) != 2 {
@@ -269,30 +388,49 @@ func buildResultWithIndices(grid [][]string, startRow, headerRows, actualHeaderR
 	header := make([]string, maxCol)
 
 	if actualHeaderRowIndex >= 0 && actualDataStartIndex >= 0 {
-		// Use multiple rows from header to data start for complex headers
+		// When we have a specific header row, use it directly first, then fill gaps with subsequent rows
 		for c := 0; c < maxCol; c++ {
-			var headerParts []string
-			for r := actualHeaderRowIndex; r < actualDataStartIndex && r < len(grid); r++ {
-				if c < len(grid[r]) {
-					val := strings.TrimSpace(grid[r][c])
-					if val != "" {
-						headerParts = append(headerParts, val)
+			var headerValue string
+
+			// First, try to get the value from the specific header row
+			if actualHeaderRowIndex < len(grid) && c < len(grid[actualHeaderRowIndex]) {
+				headerValue = strings.TrimSpace(grid[actualHeaderRowIndex][c])
+			}
+
+			// If the header row is empty for this column, look in subsequent rows until data starts
+			// but stop if we find data-like content (like category names)
+			if headerValue == "" {
+				for r := actualHeaderRowIndex + 1; r < actualDataStartIndex && r < len(grid); r++ {
+					if c < len(grid[r]) {
+						val := strings.TrimSpace(grid[r][c])
+						if val != "" {
+							// Check if this looks like a header (short, likely column name) vs data/category
+							// Skip very long values that are likely category names or data
+							if len(val) <= 50 && !strings.Contains(val, " ") {
+								headerValue = val
+								break
+							}
+						}
 					}
 				}
 			}
-			if len(headerParts) > 0 {
-				header[c] = strings.Join(headerParts, " ")
-			}
+
+			header[c] = headerValue
 		}
 	} else {
 		// Fallback to original logic if no specific header row identified
+		// Also use "last non-empty" logic here for consistency
 		for c := 0; c < maxCol; c++ {
+			var lastNonEmptyValue string
 			for r := 0; r < headerRows; r++ {
-				val := strings.TrimSpace(grid[startRow+r][c])
-				if val != "" {
-					header[c] = val
+				if startRow+r < len(grid) && c < len(grid[startRow+r]) {
+					val := strings.TrimSpace(grid[startRow+r][c])
+					if val != "" {
+						lastNonEmptyValue = val
+					}
 				}
 			}
+			header[c] = lastNonEmptyValue
 		}
 	}
 
@@ -307,7 +445,7 @@ func buildResultWithIndices(grid [][]string, startRow, headerRows, actualHeaderR
 		row := make([]string, maxCol)
 		empty := true
 		for j := 0; j < maxCol && j < len(grid[i]); j++ {
-			row[j] = grid[i][j]
+			row[j] = strings.TrimSpace(grid[i][j]) // Apply trim here too
 			if row[j] != "" {
 				empty = false
 			}

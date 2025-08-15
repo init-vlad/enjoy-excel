@@ -13,8 +13,8 @@ import (
 
 func TestApp(parseExcelService app.ExcelParserService) {
 	var s = suite{parseExcelService}
-	// s.runAll()
-	s.run("ERC.xlsx")
+	s.runAll()
+	// s.run("ERC.xlsx")
 }
 
 type suite struct {
