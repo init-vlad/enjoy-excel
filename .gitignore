@@ -2,6 +2,7 @@
 !/config/example.yaml
 /nova
 /build
+/dest
 /tmp
 /storage
 

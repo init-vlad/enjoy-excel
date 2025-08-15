@@ -4,18 +4,40 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
-	"math"
-	"os"
+	"strconv"
 	"strings"
 
 	"github.com/init-pkg/nova-template/domain/app"
 	"github.com/init-pkg/nova/errs"
 	nova_ctx "github.com/init-pkg/nova/shared/ctx"
 
+	"github.com/invopop/jsonschema"
 	openai "github.com/openai/openai-go/v2"
 	"github.com/xuri/excelize/v2"
 )
+
+type GPTAnalysisResponse struct {
+	HeaderRowIndex int    `json:"header_row_index" jsonschema_description:"Index of the row in the provided list that contains the actual table column headers (like Бренд, Артикул, etc.). This is relative to the rows provided in the prompt, starting from 0."`
+	DataStartIndex int    `json:"data_start_index" jsonschema_description:"Index of the first row in the provided list that contains actual table data. Must be greater than header_row_index."`
+	Reasoning      string `json:"reasoning" jsonschema_description:"Brief explanation of the analysis and why these row indices were chosen"`
+}
+
+func GenerateSchema[T any]() interface{} {
+	// Structured Outputs uses a subset of JSON schema
+	// These flags are necessary to comply with the subset
+	reflector := jsonschema.Reflector{
+		AllowAdditionalProperties: false,
+		DoNotReference:            true,
+	}
+	var v T
+	schema := reflector.Reflect(v)
+	return schema
+}
+
+// Generate the JSON schema at initialization time
+var GPTAnalysisResponseSchema = GenerateSchema[GPTAnalysisResponse]()
 
 type ExcelParserService struct {
 	openaiClient *openai.Client
@@ -35,12 +57,6 @@ func (this *ExcelParserService) Parse(ctx nova_ctx.Ctx, file []byte) ([]*app.Par
 		return nil, errs.WrapAppError(err, &errs.ErrorOpts{})
 	}
 
-	js, err := json.Marshal(res)
-	if err != nil {
-		return nil, errs.WrapAppError(err, &errs.ErrorOpts{})
-	}
-
-	os.WriteFile("parsed_result.json", js, 0644)
 	return res, nil
 }
 
@@ -53,6 +69,8 @@ type memHeaderCache struct {
 }
 
 func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, error) {
+	this.log.Info("Excel parsing started")
+
 	f, err := excelize.OpenReader(bytes.NewReader(file))
 	if err != nil {
 		return nil, err
@@ -78,30 +96,26 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 					nonEmptyCount++
 				}
 			}
-			this.log.Info("checking row for start", "sheet", sheet, "row", i, "nonEmptyCount", nonEmptyCount, "rowData", grid[i])
 			if nonEmptyCount >= 3 {
 				startRow = i
 				break
 			}
 		}
 		if startRow == -1 {
-			this.log.Info("no start row found", "sheet", sheet)
 			continue
 		}
-		this.log.Info("found start row", "sheet", sheet, "startRow", startRow)
 
-		// Determine header rows using embeddings
+		// Determine header rows using GPT
 		potentialHeaderRows := min(10, len(grid)-startRow)
-		embeddings := make([][]float64, 0, potentialHeaderRows)
 		rowTexts := make([]string, 0, potentialHeaderRows)
-		this.log.Info("analyzing potential header rows", "sheet", sheet, "potentialHeaderRows", potentialHeaderRows)
+		rowIndices := make([]int, 0, potentialHeaderRows) // Track original indices
 		for j := 0; j < potentialHeaderRows; j++ {
 			text := strings.Join(grid[startRow+j][:maxCol], " ")
-			this.log.Info("potential header row", "sheet", sheet, "rowIndex", startRow+j, "text", text, "rowData", grid[startRow+j][:maxCol])
 			if strings.TrimSpace(text) == "" {
 				continue
 			}
 			rowTexts = append(rowTexts, text)
+			rowIndices = append(rowIndices, startRow+j) // Store original row index
 		}
 
 		if len(rowTexts) < 2 {
@@ -110,68 +124,71 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 			if len(rowTexts) == 1 {
 				headerRows = 1
 			}
-			this.log.Info("too few rows for AI analysis, using fallback", "sheet", sheet, "rowTextsCount", len(rowTexts), "headerRows", headerRows)
-			result := buildResult(grid, startRow, headerRows, maxCol)
+			result := buildResultWithIndices(grid, startRow, headerRows, -1, -1, maxCol)
 			results = append(results, result)
 			continue
 		}
 
-		// Get embeddings
-		req := openai.EmbeddingNewParams{
-			Model: openai.EmbeddingModelTextEmbedding3Small,
-			Input: openai.EmbeddingNewParamsInputUnion{OfArrayOfStrings: rowTexts},
+		// Use GPT to analyze header structure
+		prompt := "Analyze this Excel data and identify which row contains the actual table column headers and where the data starts. " +
+			"Look for rows with column names like 'Бренд', 'Артикул', 'Наименование', 'Цена', 'Остаток', etc. " +
+			"Ignore contact info, metadata, and empty rows.\n\nRows:\n"
+
+		for i, text := range rowTexts {
+			prompt += fmt.Sprintf("Row %d: %s\n", i, text)
 		}
-		resp, err := this.openaiClient.Embeddings.New(context.Background(), req)
+
+		schemaParam := openai.ResponseFormatJSONSchemaJSONSchemaParam{
+			Name:        "gpt_analysis_response",
+			Description: openai.String("Analysis of Excel data to determine header rows"),
+			Schema:      GPTAnalysisResponseSchema,
+			Strict:      openai.Bool(true),
+		}
+
+		req := openai.ChatCompletionNewParams{
+			Model: openai.ChatModelGPT5Nano,
+			Messages: []openai.ChatCompletionMessageParamUnion{
+				openai.UserMessage(prompt),
+			},
+			ResponseFormat: openai.ChatCompletionNewParamsResponseFormatUnion{
+				OfJSONSchema: &openai.ResponseFormatJSONSchemaParam{
+					JSONSchema: schemaParam,
+				},
+			},
+		}
+
+		resp, err := this.openaiClient.Chat.Completions.New(context.Background(), req)
 		if err != nil {
-			this.log.Error("failed to create embeddings", "error", err)
+			this.log.Error("failed to get GPT response", "error", err)
 			// Fallback to heuristic: assume 1-2 header rows
-			result := buildResult(grid, startRow, 1, maxCol)
+			result := buildResultWithIndices(grid, startRow, 1, -1, -1, maxCol)
 			results = append(results, result)
 			continue
 		}
 
-		for _, emb := range resp.Data {
-			embeddings = append(embeddings, emb.Embedding)
-		}
+		headerRows := 1 // Default fallback
+		actualHeaderRowIndex := -1
+		actualDataStartIndex := -1
 
-		this.log.Info("got embeddings", "sheet", sheet, "embeddingsCount", len(embeddings))
+		if len(resp.Choices) > 0 {
+			gptResponse := strings.TrimSpace(resp.Choices[0].Message.Content)
 
-		// Find cutoff where similarity drops
-		headerRows := 1
-
-		// Look for transition from header-like to data-like content
-		// Header rows typically have fewer filled cells and more structural text
-		// Data rows typically have more filled cells with actual values
-		for i := 1; i < len(embeddings); i++ {
-			sim := cosineSimilarity(embeddings[i-1], embeddings[i])
-			this.log.Info("similarity between rows", "sheet", sheet, "row1", i-1, "row2", i, "similarity", sim)
-
-			// Check if current row looks like data (has enough non-empty cells that look like values)
-			currentRowIndex := startRow + i
-			if currentRowIndex < len(grid) {
-				nonEmptyCount := 0
-				hasDataLikeContent := false
-				for _, cell := range grid[currentRowIndex] {
-					if strings.TrimSpace(cell) != "" {
-						nonEmptyCount++
-						// Check if this looks like actual data (numbers, codes, etc.)
-						if strings.Contains(cell, ".") || len(cell) > 10 ||
-							(len(cell) > 3 && strings.ContainsAny(cell, "0123456789")) {
-							hasDataLikeContent = true
-						}
-					}
+			// Parse JSON response directly (no markdown blocks with structured outputs)
+			var analysis GPTAnalysisResponse
+			if parseErr := json.Unmarshal([]byte(gptResponse), &analysis); parseErr == nil {
+				if analysis.HeaderRowIndex >= 0 && analysis.HeaderRowIndex < len(rowTexts) &&
+					analysis.DataStartIndex >= 0 && analysis.DataStartIndex < len(rowTexts) &&
+					analysis.DataStartIndex > analysis.HeaderRowIndex {
+					// Convert rowTexts indices to actual grid indices
+					actualHeaderRowIndex = rowIndices[analysis.HeaderRowIndex]
+					actualDataStartIndex = rowIndices[analysis.DataStartIndex]
 				}
-
-				this.log.Info("row analysis", "sheet", sheet, "rowIndex", currentRowIndex,
-					"nonEmptyCount", nonEmptyCount, "hasDataLikeContent", hasDataLikeContent)
-
-				// If we have enough filled cells and data-like content, this is probably where data starts
-				if nonEmptyCount >= 3 && hasDataLikeContent {
-					break
+			} else {
+				// Fallback: try to parse as plain number
+				if parsed, parseErr := strconv.Atoi(strings.TrimSpace(gptResponse)); parseErr == nil && parsed > 0 && parsed <= len(rowTexts) {
+					headerRows = parsed
 				}
 			}
-
-			headerRows = i + 1
 		}
 
 		// Cap at reasonable number
@@ -179,16 +196,12 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 			headerRows = 3 // Reasonable fallback for complex headers
 		}
 
-		this.log.Info("determined header rows", "sheet", sheet, "headerRows", headerRows)
-
-		result := buildResult(grid, startRow, headerRows, maxCol)
-
-		// Log the final result
-		this.log.Info("built result", "sheet", sheet, "header", result.Header, "rowsCount", len(result.Rows))
+		result := buildResultWithIndices(grid, startRow, headerRows, actualHeaderRowIndex, actualDataStartIndex, maxCol)
 
 		results = append(results, result)
 	}
 
+	this.log.Info("Excel parsing completed successfully", "sheetsProcessed", len(results))
 	return results, nil
 }
 
@@ -211,8 +224,8 @@ func getFilledGrid(f *excelize.File, sheet string) ([][]string, int, error) {
 	grid := make([][]string, len(rows))
 	for i := range grid {
 		grid[i] = make([]string, maxCol)
-		for j, cell := range rows[i] {
-			grid[i][j] = cell
+		if len(rows[i]) > 0 {
+			copy(grid[i], rows[i])
 		}
 	}
 
@@ -251,30 +264,49 @@ func getFilledGrid(f *excelize.File, sheet string) ([][]string, int, error) {
 	return grid, maxCol, nil
 }
 
-func buildResult(grid [][]string, startRow, headerRows, maxCol int) *app.ParseExcelResult {
-	// Build header: lowest non-empty in header rows for each col
+func buildResultWithIndices(grid [][]string, startRow, headerRows, actualHeaderRowIndex, actualDataStartIndex, maxCol int) *app.ParseExcelResult {
+	// Build header using specific header row index if provided
 	header := make([]string, maxCol)
-	for c := 0; c < maxCol; c++ {
-		// Start from the top and go down, keeping the last (bottom-most) non-empty value
-		for r := 0; r < headerRows; r++ {
-			val := strings.TrimSpace(grid[startRow+r][c])
-			if val != "" {
-				header[c] = val
-				// Don't break - continue to overwrite with lower values
+
+	if actualHeaderRowIndex >= 0 && actualDataStartIndex >= 0 {
+		// Use multiple rows from header to data start for complex headers
+		for c := 0; c < maxCol; c++ {
+			var headerParts []string
+			for r := actualHeaderRowIndex; r < actualDataStartIndex && r < len(grid); r++ {
+				if c < len(grid[r]) {
+					val := strings.TrimSpace(grid[r][c])
+					if val != "" {
+						headerParts = append(headerParts, val)
+					}
+				}
+			}
+			if len(headerParts) > 0 {
+				header[c] = strings.Join(headerParts, " ")
 			}
 		}
-		// If no value found, header[c] remains empty string (zero value)
+	} else {
+		// Fallback to original logic if no specific header row identified
+		for c := 0; c < maxCol; c++ {
+			for r := 0; r < headerRows; r++ {
+				val := strings.TrimSpace(grid[startRow+r][c])
+				if val != "" {
+					header[c] = val
+				}
+			}
+		}
 	}
 
-	// Log the final header construction
-	// Note: this will be logged by the caller
-
-	// Build rows: from startRow + headerRows to end, skip empty
+	// Build rows starting from data start index if provided, otherwise use headerRows
 	var rows [][]string
-	for i := startRow + headerRows; i < len(grid); i++ {
+	dataStart := startRow + headerRows
+	if actualDataStartIndex >= 0 {
+		dataStart = actualDataStartIndex
+	}
+
+	for i := dataStart; i < len(grid); i++ {
 		row := make([]string, maxCol)
 		empty := true
-		for j := 0; j < maxCol; j++ {
+		for j := 0; j < maxCol && j < len(grid[i]); j++ {
 			row[j] = grid[i][j]
 			if row[j] != "" {
 				empty = false
@@ -289,24 +321,6 @@ func buildResult(grid [][]string, startRow, headerRows, maxCol int) *app.ParseEx
 		Header: header,
 		Rows:   rows,
 	}
-}
-
-func cosineSimilarity(a, b []float64) float64 {
-	if len(a) != len(b) {
-		return 0
-	}
-	dot := 0.0
-	normA := 0.0
-	normB := 0.0
-	for i := range a {
-		dot += a[i] * b[i]
-		normA += a[i] * a[i]
-		normB += b[i] * b[i]
-	}
-	if normA == 0 || normB == 0 {
-		return 0
-	}
-	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
 func min(a, b int) int {
