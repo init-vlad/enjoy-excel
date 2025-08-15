@@ -121,6 +121,8 @@ func (s *ExcelParserService) parse(file []byte) (*app.ParseExcelResult, error) {
 	h := detectHeaderDepth(block)
 	header := buildHeader(block, h)
 	data := block[h:]
+	idxs := columnsToKeep(header, data)
+	header, data = projectColumns(header, data, idxs)
 
 	// Нормализуем ширину (некоторые строки могут быть короче)
 	maxW := 0
@@ -676,7 +678,7 @@ func buildHeader(block [][]string, h int) []string {
 	}
 	h = min(h, len(block))
 
-	// максимальная ширина по всему блоку (чтобы не терять «хвост»)
+	// ширина берём по всему блоку — чтобы увидеть правый хвост
 	maxW := 0
 	for _, r := range block {
 		if len(r) > maxW {
@@ -693,7 +695,7 @@ func buildHeader(block [][]string, h int) []string {
 			}
 		}
 		if len(parts) == 0 {
-			// если в данных под колонкой есть что-то — назовём undefined_N
+			// посмотрим, есть ли данные под колонкой
 			hasData := false
 			for r := h; r < len(block); r++ {
 				if j < len(block[r]) && strings.TrimSpace(block[r][j]) != "" {
@@ -704,7 +706,7 @@ func buildHeader(block [][]string, h int) []string {
 			if hasData {
 				header[j] = fmt.Sprintf("undefined_%d", j+1)
 			} else {
-				header[j] = fmt.Sprintf("col_%d", j+1)
+				header[j] = fmt.Sprintf("col_%d", j+1) // временное имя (скорее всего колонка удалится)
 			}
 		} else {
 			header[j] = normalizeHeader(strings.Join(parts, " / "))
@@ -759,4 +761,60 @@ func titleToNumber(s string) int {
 		n = n*26 + int(s[i]-'A') + 1
 	}
 	return n
+}
+
+// возвращает список индексов колонок, которые нужно сохранить
+func columnsToKeep(header []string, data [][]string) []int {
+	maxW := len(header)
+	W := min(200, len(data)) // окно по данным
+	keep := make([]bool, maxW)
+
+	for j := 0; j < maxW; j++ {
+		// признак "заголовок задан"
+		hasHeader := header[j] != "" && !strings.HasPrefix(header[j], "col_")
+		// считаем непустые в данных
+		nonEmpty := 0
+		for i := 0; i < W; i++ {
+			if j < len(data[i]) && strings.TrimSpace(data[i][j]) != "" {
+				nonEmpty++
+				if nonEmpty >= 3 { // ранний выход: точно есть данные
+					break
+				}
+			}
+		}
+		// порог для "почти пустой" колонки: ≤2 непустых на первых W строках
+		if hasHeader || nonEmpty >= 3 {
+			keep[j] = true
+		} else {
+			keep[j] = false // хвост мерджа/мусор — выкидываем
+		}
+	}
+
+	// сформируем список индексов
+	out := make([]int, 0, maxW)
+	for j := 0; j < maxW; j++ {
+		if keep[j] {
+			out = append(out, j)
+		}
+	}
+	return out
+}
+
+// применяем список индексов к header и data
+func projectColumns(header []string, data [][]string, idxs []int) ([]string, [][]string) {
+	newHeader := make([]string, len(idxs))
+	for k, j := range idxs {
+		newHeader[k] = header[j]
+	}
+	newData := make([][]string, len(data))
+	for i := range data {
+		row := make([]string, len(idxs))
+		for k, j := range idxs {
+			if j < len(data[i]) {
+				row[k] = data[i][j]
+			}
+		}
+		newData[i] = row
+	}
+	return newHeader, newData
 }

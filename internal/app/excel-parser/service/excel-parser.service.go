@@ -15,13 +15,14 @@ import (
 type ExcelParserService struct {
 	openaiClient *openai.Client
 	log          *slog.Logger
+	cache        HeaderCache
 }
 
 var _ app.ExcelParserService = &ExcelParserService{}
 
 func New(openaiClient *openai.Client, log *slog.Logger) *ExcelParserService {
 
-	return &ExcelParserService{openaiClient, log}
+	return &ExcelParserService{openaiClient, log, &memHeaderCache{}}
 }
 
 func (this *ExcelParserService) Parse(ctx nova_ctx.Ctx, file []byte) (*app.ParseExcelResult, errs.Error) {
