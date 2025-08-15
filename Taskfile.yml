@@ -1,0 +1,57 @@
+version: "3"
+
+vars:
+  CFG: "--config-path=config/conf.yaml"
+  TABLE: ""
+
+tasks:
+  run:
+    cmds:
+      - go run cmd/main.go {{.CFG}}
+
+  build:
+    cmds:
+      - GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o build/app cmd/main.go
+
+  fresh:
+    cmds:
+      - go run cmd/automigrate/fresh/main.go {{.CFG}}
+
+  automigrate:
+    cmds:
+      - go run cmd/automigrate/main.go {{.CFG}}
+
+  refresh:
+    cmds:
+      - go run cmd/automigrate/fresh/main.go {{.CFG}}
+      - go run cmd/seed/main.go {{.CFG}}
+
+  migrate-up:
+    cmds:
+      - go run cmd/migrate/main.go {{.CFG}} --down=false
+
+  migrate-down:
+    cmds:
+      - go run cmd/migrate/main.go {{.CFG}} --down=true
+
+  seed:
+    cmds:
+      - go run cmd/seed/main.go {{.CFG}}
+
+  gendoc:
+    cmds:
+      - swag init -g cmd/main.go
+
+  test:
+    cmds:
+      - CONFIG_PATH="$(pwd)/config/test.yaml" go test ./...
+
+  make-postgres-migration:
+    desc: "Create a new SQL migration for Postgres (usage: task make-postgres-migration TABLE=table_name)"
+    cmds:
+      - goose -dir ./migrations/postgres create create_{{.TABLE}}_table sql
+
+  make-mysql-migration:
+    desc: "Create a new SQL migration for MariaDB (usage: task make-mysql-migration TABLE=table_name)"
+    cmds:
+      - goose -dir ./migrations/mysql create create_{{.TABLE}}_table sql

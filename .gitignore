@@ -1,0 +1,9 @@
+/config/*
+!/config/example.yaml
+/nova
+/build
+/tmp
+/storage
+
+cmd/migrate/migrations/*/*.bak
+cmd/migrate/migrations/*/*.tmp 

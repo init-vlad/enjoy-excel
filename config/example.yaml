@@ -1,0 +1,83 @@
+app:
+  default_locale: en
+  self_url: "http://localhost:8000"
+  version: "1.0.0"
+
+logger:
+  # "debug" | "info" | "warn" | "error"
+  console_level: "debug"
+  file_level: "debug"
+  stack_depth: 99
+  stack_offset: 5
+
+auth:
+  jwt_secret: "secret"
+
+transports:
+  fiber:
+    port: 8000
+    allow_origins:
+      - "http://localhost:3000"
+      - "http://localhost:3001"
+    prefork: false
+
+  amqp:
+    user: guest
+    password: guest
+    addr: localhost:5672
+
+    tls: false
+    ca_cert: ""
+    client_cert_key: ""
+    client_cert: ""
+
+infrastructure:
+  db:
+    # "postgres" | "mysql"
+    dialect: "postgres"
+    host: "localhost"
+    user: "postgres"
+    password: "root"
+    dbname: "nova_template_db"
+    port: 5432
+    sslmode: "disable"
+    timezone: "UTC"
+
+  redis:
+    addr: "localhost:6379"
+    protocol: 3
+    username: ""
+    password: ""
+    db: 0
+
+  minio:
+    client:
+      endpoint: "localhost:9000"
+      username: "minioadmin"
+      password: "minioadmin"
+      use_ssl: false
+
+    storage:
+      ensure_bucket: true
+      bucket_name: "nova-template-bucket" # do not use "_" or " " in bucket name
+
+clients:
+  # put external service configs here (e.g. payment_api, notification_api)
+
+internal:
+  # put configs for internal microservices/modules here
+
+# not implemented
+monitoring:
+  prometheus:
+    enabled: false
+    path: ""
+
+  sentry:
+    dsn: ""
+
+# not implemented
+tracing:
+  enabled: false
+  provider: ""
+  endpoint: ""
