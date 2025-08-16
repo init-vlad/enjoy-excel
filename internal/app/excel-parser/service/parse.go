@@ -35,6 +35,17 @@ type GPTTableValidationResponse struct {
 	Reasoning      string `json:"reasoning" jsonschema_description:"Brief explanation of why this is or isn't a product table"`
 }
 
+// CacheEntry represents a single cache entry with collision resistance
+type CacheEntry struct {
+	HeaderStart    int    `json:"header_start"` // Start row index of headers
+	HeaderEnd      int    `json:"header_end"`   // End row index of headers
+	HeaderHash     string `json:"header_hash"`  // Exact hash of header strings
+	IsProductTable bool   `json:"is_product_table"`
+	Confidence     int    `json:"confidence"`
+	Reasoning      string `json:"reasoning"`
+	Timestamp      int64  `json:"timestamp"`
+}
+
 func GenerateSchema[T any]() interface{} {
 	// Structured Outputs uses a subset of JSON schema
 	// These flags are necessary to comply with the subset
@@ -56,6 +67,7 @@ const (
 	cacheTTL                = 30 * 24 * time.Hour // 30 days
 	tableValidationCacheKey = "excel_parser:table_validation:"
 	headerAnalysisCacheKey  = "excel_parser:header_analysis:"
+	advancedCacheKey        = "excel_parser:advanced_cache:"
 )
 
 type ExcelParserService struct {
@@ -115,6 +127,192 @@ func (this *ExcelParserService) generateTableValidationCacheKey(headers []string
 		"cacheKey", cacheKey[:20]+"...")
 
 	return cacheKey
+}
+
+// generateAdvancedCacheKey creates a primary cache key from first row hash
+func (this *ExcelParserService) generateAdvancedCacheKey(headers []string) string {
+	// Use only first meaningful header for primary key to group similar tables
+	primaryHeader := ""
+	for _, header := range headers {
+		if strings.TrimSpace(header) != "" {
+			primaryHeader = strings.TrimSpace(header)
+			break
+		}
+	}
+
+	// Fallback to all headers if no meaningful first header
+	if primaryHeader == "" {
+		primaryHeader = strings.Join(headers, "|")
+	}
+
+	hash := md5.Sum([]byte(primaryHeader))
+	primaryKey := advancedCacheKey + hex.EncodeToString(hash[:])
+
+	this.log.Debug("Generated advanced cache primary key",
+		"primaryHeader", primaryHeader,
+		"primaryKey", primaryKey[:20]+"...")
+
+	return primaryKey
+}
+
+// generateExactHeaderHash creates exact hash from all headers for collision detection
+func (this *ExcelParserService) generateExactHeaderHash(headers []string) string {
+	headerText := strings.Join(headers, "||")
+	hash := md5.Sum([]byte(headerText))
+	return hex.EncodeToString(hash[:])
+}
+
+// getAdvancedCachedTableValidation retrieves cached result with collision resistance
+func (this *ExcelParserService) getAdvancedCachedTableValidation(headers []string, headerStart, headerEnd int) (*GPTTableValidationResponse, bool) {
+	primaryKey := this.generateAdvancedCacheKey(headers)
+	exactHash := this.generateExactHeaderHash(headers)
+
+	this.log.Debug("Checking advanced table validation cache",
+		"primaryKey", primaryKey[:20]+"...",
+		"exactHash", exactHash[:16]+"...",
+		"headerStart", headerStart,
+		"headerEnd", headerEnd)
+
+	// Get array of cache entries
+	cachedData, err := this.redisClient.Get(context.Background(), primaryKey).Result()
+	if err == redis.Nil {
+		this.log.Debug("Advanced cache primary key miss", "primaryKey", primaryKey[:20]+"...")
+		return nil, false
+	}
+	if err != nil {
+		this.log.Error("Error retrieving from advanced cache", "error", err, "primaryKey", primaryKey[:20]+"...")
+		return nil, false
+	}
+
+	var cacheEntries []CacheEntry
+	if err := json.Unmarshal([]byte(cachedData), &cacheEntries); err != nil {
+		this.log.Error("Error unmarshaling advanced cache entries", "error", err, "primaryKey", primaryKey[:20]+"...")
+		return nil, false
+	}
+
+	// Find exact match by header hash and boundaries
+	for _, entry := range cacheEntries {
+		if entry.HeaderHash == exactHash &&
+			entry.HeaderStart == headerStart &&
+			entry.HeaderEnd == headerEnd {
+
+			this.log.Info("Advanced cache exact match found",
+				"primaryKey", primaryKey[:20]+"...",
+				"exactHash", exactHash[:16]+"...",
+				"headerStart", headerStart,
+				"headerEnd", headerEnd,
+				"isProductTable", entry.IsProductTable,
+				"confidence", entry.Confidence,
+				"entryAge", time.Since(time.Unix(entry.Timestamp, 0)).String())
+
+			return &GPTTableValidationResponse{
+				IsProductTable: entry.IsProductTable,
+				Confidence:     entry.Confidence,
+				Reasoning:      entry.Reasoning,
+			}, true
+		}
+	}
+
+	this.log.Debug("Advanced cache: no exact match found",
+		"primaryKey", primaryKey[:20]+"...",
+		"exactHash", exactHash[:16]+"...",
+		"entriesChecked", len(cacheEntries))
+
+	return nil, false
+}
+
+// setAdvancedCachedTableValidation stores result with collision resistance
+func (this *ExcelParserService) setAdvancedCachedTableValidation(headers []string, headerStart, headerEnd int, validation *GPTTableValidationResponse) {
+	primaryKey := this.generateAdvancedCacheKey(headers)
+	exactHash := this.generateExactHeaderHash(headers)
+
+	this.log.Debug("Setting advanced table validation cache",
+		"primaryKey", primaryKey[:20]+"...",
+		"exactHash", exactHash[:16]+"...",
+		"headerStart", headerStart,
+		"headerEnd", headerEnd,
+		"isProductTable", validation.IsProductTable)
+
+	// Get existing entries
+	var cacheEntries []CacheEntry
+	if cachedData, err := this.redisClient.Get(context.Background(), primaryKey).Result(); err == nil {
+		if unmarshalErr := json.Unmarshal([]byte(cachedData), &cacheEntries); unmarshalErr != nil {
+			this.log.Error("Error unmarshaling existing cache entries", "error", unmarshalErr)
+			cacheEntries = []CacheEntry{} // Reset on error
+		}
+	}
+
+	// Create new entry
+	newEntry := CacheEntry{
+		HeaderStart:    headerStart,
+		HeaderEnd:      headerEnd,
+		HeaderHash:     exactHash,
+		IsProductTable: validation.IsProductTable,
+		Confidence:     validation.Confidence,
+		Reasoning:      validation.Reasoning,
+		Timestamp:      time.Now().Unix(),
+	}
+
+	// Check if entry already exists (update) or add new
+	found := false
+	for i, entry := range cacheEntries {
+		if entry.HeaderHash == exactHash &&
+			entry.HeaderStart == headerStart &&
+			entry.HeaderEnd == headerEnd {
+			cacheEntries[i] = newEntry // Update existing
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		cacheEntries = append(cacheEntries, newEntry) // Add new
+	}
+
+	// Clean old entries (keep max 50 entries, remove entries older than 45 days)
+	maxEntries := 50
+	maxAge := 45 * 24 * time.Hour
+	cleanedEntries := make([]CacheEntry, 0, len(cacheEntries))
+	now := time.Now()
+
+	for _, entry := range cacheEntries {
+		if now.Sub(time.Unix(entry.Timestamp, 0)) <= maxAge {
+			cleanedEntries = append(cleanedEntries, entry)
+		}
+	}
+
+	// If still too many, keep most recent
+	if len(cleanedEntries) > maxEntries {
+		// Sort by timestamp desc and take first maxEntries
+		for i := 0; i < len(cleanedEntries)-1; i++ {
+			for j := i + 1; j < len(cleanedEntries); j++ {
+				if cleanedEntries[i].Timestamp < cleanedEntries[j].Timestamp {
+					cleanedEntries[i], cleanedEntries[j] = cleanedEntries[j], cleanedEntries[i]
+				}
+			}
+		}
+		cleanedEntries = cleanedEntries[:maxEntries]
+	}
+
+	// Save updated entries
+	data, err := json.Marshal(cleanedEntries)
+	if err != nil {
+		this.log.Error("Error marshaling advanced cache entries", "error", err, "primaryKey", primaryKey[:20]+"...")
+		return
+	}
+
+	err = this.redisClient.Set(context.Background(), primaryKey, data, 30*24*time.Hour).Err()
+	if err != nil {
+		this.log.Error("Error storing advanced cache entries", "error", err, "primaryKey", primaryKey[:20]+"...")
+		return
+	}
+
+	this.log.Info("Advanced cache updated successfully",
+		"primaryKey", primaryKey[:20]+"...",
+		"exactHash", exactHash[:16]+"...",
+		"totalEntries", len(cleanedEntries),
+		"isProductTable", validation.IsProductTable,
+		"confidence", validation.Confidence)
 } // normalizeDataForCaching normalizes data values to detect patterns rather than cache specific values
 func (this *ExcelParserService) normalizeDataForCaching(value string) string {
 	value = strings.TrimSpace(value)
@@ -342,12 +540,28 @@ func (this *ExcelParserService) Parse(ctx nova_ctx.Ctx, file []byte) ([]*app.Par
 
 // isProductTable checks if the given table structure represents a product/goods table
 func (this *ExcelParserService) isProductTable(header []string, sampleRows [][]string) bool {
-	// Check cache first
+	return this.isProductTableWithBoundaries(header, sampleRows, -1, -1)
+}
+
+// isProductTableWithBoundaries checks table with header boundary information for advanced caching
+func (this *ExcelParserService) isProductTableWithBoundaries(header []string, sampleRows [][]string, headerStart, headerEnd int) bool {
+	// Check advanced cache first (with collision resistance)
+	if headerStart >= 0 && headerEnd >= 0 {
+		if cached, found := this.getAdvancedCachedTableValidation(header, headerStart, headerEnd); found {
+			this.log.Info("Using advanced cached table validation result",
+				"isProductTable", cached.IsProductTable,
+				"confidence", cached.Confidence,
+				"reasoning", cached.Reasoning[:min(100, len(cached.Reasoning))]+"...")
+			return cached.IsProductTable && cached.Confidence >= 7
+		}
+	}
+
+	// Fallback to old cache system for compatibility
 	if cached, found := this.getCachedTableValidation(header, sampleRows); found {
-		this.log.Info("Using cached table validation result",
+		this.log.Info("Using legacy cached table validation result",
 			"isProductTable", cached.IsProductTable,
 			"confidence", cached.Confidence,
-			"reasoning", cached.Reasoning)
+			"reasoning", cached.Reasoning[:min(100, len(cached.Reasoning))]+"...")
 		return cached.IsProductTable && cached.Confidence >= 7
 	}
 
@@ -404,8 +618,13 @@ func (this *ExcelParserService) isProductTable(header []string, sampleRows [][]s
 		gptResponse := strings.TrimSpace(resp.Choices[0].Message.Content)
 		var validation GPTTableValidationResponse
 		if parseErr := json.Unmarshal([]byte(gptResponse), &validation); parseErr == nil {
-			// Cache the result
+			// Cache in both systems
 			this.setCachedTableValidation(header, sampleRows, &validation)
+
+			// Advanced cache with boundaries if available
+			if headerStart >= 0 && headerEnd >= 0 {
+				this.setAdvancedCachedTableValidation(header, headerStart, headerEnd, &validation)
+			}
 
 			this.log.Info("GPT table validation result",
 				"isProductTable", validation.IsProductTable,
@@ -475,8 +694,9 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 			"firstFewHeaders", heuristicHeaders[:min(3, len(heuristicHeaders))])
 
 		// Check cache for table validation using heuristic headers
-		if cached, found := this.getCachedTableValidation(heuristicHeaders, heuristicSampleRows); found {
-			this.log.Info("Using cached table validation for early decision",
+		// Try advanced cache first, then fallback to legacy cache
+		if cached, found := this.getAdvancedCachedTableValidation(heuristicHeaders, startRow, startRow); found {
+			this.log.Info("Using advanced cached table validation for early decision",
 				"sheet", sheet,
 				"isProductTable", cached.IsProductTable,
 				"confidence", cached.Confidence,
@@ -484,7 +704,19 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 
 			// If cache says it's not a product table with high confidence, skip expensive processing
 			if !cached.IsProductTable && cached.Confidence >= 7 {
-				this.log.Info("Skipping sheet based on cached validation - not a product table", "sheet", sheet)
+				this.log.Info("Skipping sheet based on advanced cached validation - not a product table", "sheet", sheet)
+				continue
+			}
+		} else if cached, found := this.getCachedTableValidation(heuristicHeaders, heuristicSampleRows); found {
+			this.log.Info("Using legacy cached table validation for early decision",
+				"sheet", sheet,
+				"isProductTable", cached.IsProductTable,
+				"confidence", cached.Confidence,
+				"reasoning", cached.Reasoning[:min(100, len(cached.Reasoning))]+"...")
+
+			// If cache says it's not a product table with high confidence, skip expensive processing
+			if !cached.IsProductTable && cached.Confidence >= 7 {
+				this.log.Info("Skipping sheet based on legacy cached validation - not a product table", "sheet", sheet)
 				continue
 			}
 		} else {
@@ -518,7 +750,7 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 				sampleRows = sampleRows[:3]
 			}
 
-			if this.isProductTable(result.Header, sampleRows) {
+			if this.isProductTableWithBoundaries(result.Header, sampleRows, startRow, startRow+headerRows-1) {
 				this.log.Info("Minimal table validated as product table")
 				results = append(results, result)
 			} else {
@@ -589,7 +821,7 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 					sampleRows = sampleRows[:3]
 				}
 
-				if this.isProductTable(result.Header, sampleRows) {
+				if this.isProductTableWithBoundaries(result.Header, sampleRows, startRow, startRow) {
 					this.log.Info("Fallback table validated as product table")
 					results = append(results, result)
 				} else {
@@ -648,7 +880,15 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 			sampleRows = sampleRows[:3] // Limit to first 3 rows for analysis
 		}
 
-		if this.isProductTable(result.Header, sampleRows) {
+		// Use advanced caching with header boundaries
+		headerStartRow := actualHeaderRowIndex
+		headerEndRow := actualHeaderRowIndex
+		if headerStartRow < 0 {
+			headerStartRow = startRow
+			headerEndRow = startRow + headerRows - 1
+		}
+
+		if this.isProductTableWithBoundaries(result.Header, sampleRows, headerStartRow, headerEndRow) {
 			this.log.Info("Table validated as product table", "sheet", sheet)
 			results = append(results, result)
 		} else {
