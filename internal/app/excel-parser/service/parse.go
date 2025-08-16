@@ -742,7 +742,7 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 			if len(rowTexts) == 1 {
 				headerRows = 1
 			}
-			result := buildResultWithIndices(grid, startRow, headerRows, -1, -1, maxCol)
+			result := buildResultWithIndices(grid, startRow, headerRows, -1, -1, maxCol, sheet)
 
 			// Still validate even minimal tables
 			sampleRows := result.Rows
@@ -813,7 +813,7 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 			if err != nil {
 				this.log.Error("failed to get GPT response", "error", err)
 				// Fallback to heuristic: assume 1-2 header rows
-				result := buildResultWithIndices(grid, startRow, 1, -1, -1, maxCol)
+				result := buildResultWithIndices(grid, startRow, 1, -1, -1, maxCol, sheet)
 
 				// Still validate fallback tables
 				sampleRows := result.Rows
@@ -861,7 +861,7 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 			headerRows = 3 // Reasonable fallback for complex headers
 		}
 
-		result := buildResultWithIndices(grid, startRow, headerRows, actualHeaderRowIndex, actualDataStartIndex, maxCol)
+		result := buildResultWithIndices(grid, startRow, headerRows, actualHeaderRowIndex, actualDataStartIndex, maxCol, sheet)
 
 		// Log detailed information about the parsed table structure
 		this.log.Info("Parsed table structure",
@@ -964,7 +964,7 @@ func getFilledGrid(f *excelize.File, sheet string) ([][]string, int, error) {
 	return grid, maxCol, nil
 }
 
-func buildResultWithIndices(grid [][]string, startRow, headerRows, actualHeaderRowIndex, actualDataStartIndex, maxCol int) *app.ParseExcelResult {
+func buildResultWithIndices(grid [][]string, startRow, headerRows, actualHeaderRowIndex, actualDataStartIndex, maxCol int, sheetName string) *app.ParseExcelResult {
 	// Build header using specific header row index if provided
 	header := make([]string, maxCol)
 
@@ -1060,8 +1060,9 @@ func buildResultWithIndices(grid [][]string, startRow, headerRows, actualHeaderR
 	}
 
 	return &app.ParseExcelResult{
-		Header: header,
-		Rows:   rows,
+		Header:    header,
+		Rows:      rows,
+		SheetName: sheetName,
 	}
 }
 

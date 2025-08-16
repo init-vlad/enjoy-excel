@@ -6,8 +6,9 @@ import (
 )
 
 type ParseExcelResult struct {
-	Header []string   `json:"header"`
-	Rows   [][]string `json:"rows"`
+	Header    []string   `json:"header"`
+	Rows      [][]string `json:"rows"`
+	SheetName string     `json:"sheet_name"`
 }
 
 type ExcelParserService interface {
