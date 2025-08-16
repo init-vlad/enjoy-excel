@@ -19,6 +19,7 @@ import (
 
 	"github.com/invopop/jsonschema"
 	openai "github.com/openai/openai-go/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -105,10 +106,16 @@ func (this *ExcelParserService) generateTableValidationCacheKey(headers []string
 
 	keyText := strings.Join(keyParts, "||")
 	hash := md5.Sum([]byte(keyText))
-	return tableValidationCacheKey + hex.EncodeToString(hash[:])
-}
+	cacheKey := tableValidationCacheKey + hex.EncodeToString(hash[:])
 
-// normalizeDataForCaching normalizes data values to detect patterns rather than cache specific values
+	this.log.Debug("Generated table validation cache key",
+		"headers", headers,
+		"sampleRowsCount", len(sampleRows),
+		"keyText", keyText,
+		"cacheKey", cacheKey[:20]+"...")
+
+	return cacheKey
+} // normalizeDataForCaching normalizes data values to detect patterns rather than cache specific values
 func (this *ExcelParserService) normalizeDataForCaching(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -168,10 +175,13 @@ func (this *ExcelParserService) getHeuristicHeaders(grid [][]string, startRow, m
 		}
 	}
 
-	return headers
-}
+	this.log.Debug("Generated heuristic headers",
+		"startRow", startRow,
+		"maxCol", maxCol,
+		"headers", headers)
 
-// getHeuristicSampleRows gets sample data rows (excluding the header row)
+	return headers
+} // getHeuristicSampleRows gets sample data rows (excluding the header row)
 func (this *ExcelParserService) getHeuristicSampleRows(grid [][]string, startRow, maxCol int) [][]string {
 	sampleRows := make([][]string, 0, 3)
 
@@ -194,28 +204,43 @@ func (this *ExcelParserService) getHeuristicSampleRows(grid [][]string, startRow
 		}
 	}
 
+	this.log.Debug("Generated heuristic sample rows",
+		"startRow", startRow,
+		"sampleRowCount", len(sampleRows),
+		"sampleRows", sampleRows)
+
 	return sampleRows
 }
 
-// getCachedTableValidation retrieves cached table validation result
+// getCachedTableValidation attempts to retrieve cached table validation result
 func (this *ExcelParserService) getCachedTableValidation(headers []string, sampleRows [][]string) (*GPTTableValidationResponse, bool) {
 	cacheKey := this.generateTableValidationCacheKey(headers, sampleRows)
 
-	result := this.redisClient.Get(context.Background(), cacheKey)
-	if result.Err() != nil {
+	this.log.Debug("Checking table validation cache",
+		"cacheKey", cacheKey[:20]+"...",
+		"headersCount", len(headers),
+		"sampleRowsCount", len(sampleRows))
+
+	cachedData, err := this.redisClient.Get(context.Background(), cacheKey).Result()
+	if err == redis.Nil {
+		this.log.Debug("Table validation cache miss", "cacheKey", cacheKey[:20]+"...")
 		return nil, false
 	}
-
-	data, err := result.Result()
 	if err != nil {
+		this.log.Error("Error retrieving table validation from cache", "error", err, "cacheKey", cacheKey[:20]+"...")
 		return nil, false
 	}
 
 	var validation GPTTableValidationResponse
-	if err := json.Unmarshal([]byte(data), &validation); err != nil {
+	if err := json.Unmarshal([]byte(cachedData), &validation); err != nil {
+		this.log.Error("Error unmarshaling cached table validation", "error", err, "cacheKey", cacheKey[:20]+"...")
 		return nil, false
 	}
 
+	this.log.Info("Table validation cache hit",
+		"cacheKey", cacheKey[:20]+"...",
+		"isProductTable", validation.IsProductTable,
+		"reasoning", validation.Reasoning[:min(100, len(validation.Reasoning))]+"...")
 	return &validation, true
 }
 
@@ -223,37 +248,59 @@ func (this *ExcelParserService) getCachedTableValidation(headers []string, sampl
 func (this *ExcelParserService) setCachedTableValidation(headers []string, sampleRows [][]string, validation *GPTTableValidationResponse) {
 	cacheKey := this.generateTableValidationCacheKey(headers, sampleRows)
 
+	this.log.Debug("Setting table validation cache",
+		"cacheKey", cacheKey[:20]+"...",
+		"isProductTable", validation.IsProductTable,
+		"reasoning", validation.Reasoning[:min(100, len(validation.Reasoning))]+"...")
+
 	data, err := json.Marshal(validation)
 	if err != nil {
-		this.log.Error("failed to marshal table validation for cache", "error", err)
+		this.log.Error("Error marshaling table validation for cache", "error", err, "cacheKey", cacheKey[:20]+"...")
 		return
 	}
 
-	if err := this.redisClient.Set(context.Background(), cacheKey, string(data), cacheTTL).Err(); err != nil {
-		this.log.Error("failed to cache table validation", "error", err)
-	} else {
-		this.log.Debug("Cached table validation result", "cacheKey", cacheKey[:20]+"...")
+	err = this.redisClient.Set(context.Background(), cacheKey, data, 30*24*time.Hour).Err()
+	if err != nil {
+		this.log.Error("Error storing table validation in cache", "error", err, "cacheKey", cacheKey[:20]+"...")
+		return
 	}
+
+	this.log.Info("Table validation cached successfully",
+		"cacheKey", cacheKey[:20]+"...",
+		"isProductTable", validation.IsProductTable)
 }
 
 // getCachedHeaderAnalysis retrieves cached header analysis result
 func (this *ExcelParserService) getCachedHeaderAnalysis(rowTexts []string) (*GPTAnalysisResponse, bool) {
 	cacheKey := this.generateCacheKey(headerAnalysisCacheKey, rowTexts)
 
+	this.log.Debug("Checking header analysis cache",
+		"cacheKey", cacheKey[:20]+"...",
+		"rowTextsCount", len(rowTexts))
+
 	result := this.redisClient.Get(context.Background(), cacheKey)
 	if result.Err() != nil {
+		this.log.Debug("Header analysis cache miss", "cacheKey", cacheKey[:20]+"...", "error", result.Err())
 		return nil, false
 	}
 
 	data, err := result.Result()
 	if err != nil {
+		this.log.Debug("Header analysis cache miss", "cacheKey", cacheKey[:20]+"...", "error", err)
 		return nil, false
 	}
 
 	var analysis GPTAnalysisResponse
 	if err := json.Unmarshal([]byte(data), &analysis); err != nil {
+		this.log.Error("Error unmarshaling cached header analysis", "error", err, "cacheKey", cacheKey[:20]+"...")
 		return nil, false
 	}
+
+	this.log.Info("Header analysis cache hit",
+		"cacheKey", cacheKey[:20]+"...",
+		"headerRowIndex", analysis.HeaderRowIndex,
+		"dataStartIndex", analysis.DataStartIndex,
+		"reasoning", analysis.Reasoning[:min(100, len(analysis.Reasoning))]+"...")
 
 	return &analysis, true
 }
@@ -262,16 +309,25 @@ func (this *ExcelParserService) getCachedHeaderAnalysis(rowTexts []string) (*GPT
 func (this *ExcelParserService) setCachedHeaderAnalysis(rowTexts []string, analysis *GPTAnalysisResponse) {
 	cacheKey := this.generateCacheKey(headerAnalysisCacheKey, rowTexts)
 
+	this.log.Debug("Setting header analysis cache",
+		"cacheKey", cacheKey[:20]+"...",
+		"headerRowIndex", analysis.HeaderRowIndex,
+		"dataStartIndex", analysis.DataStartIndex,
+		"reasoning", analysis.Reasoning[:min(100, len(analysis.Reasoning))]+"...")
+
 	data, err := json.Marshal(analysis)
 	if err != nil {
-		this.log.Error("failed to marshal header analysis for cache", "error", err)
+		this.log.Error("failed to marshal header analysis for cache", "error", err, "cacheKey", cacheKey[:20]+"...")
 		return
 	}
 
 	if err := this.redisClient.Set(context.Background(), cacheKey, string(data), cacheTTL).Err(); err != nil {
-		this.log.Error("failed to cache header analysis", "error", err)
+		this.log.Error("failed to cache header analysis", "error", err, "cacheKey", cacheKey[:20]+"...")
 	} else {
-		this.log.Debug("Cached header analysis result", "cacheKey", cacheKey[:20]+"...")
+		this.log.Info("Header analysis cached successfully",
+			"cacheKey", cacheKey[:20]+"...",
+			"headerRowIndex", analysis.HeaderRowIndex,
+			"dataStartIndex", analysis.DataStartIndex)
 	}
 }
 
@@ -332,6 +388,11 @@ func (this *ExcelParserService) isProductTable(header []string, sampleRows [][]s
 			},
 		},
 	}
+
+	this.log.Info("Making GPT API call for table validation",
+		"headersCount", len(header),
+		"sampleRowsCount", len(sampleRows),
+		"headerText", headerText[:min(100, len(headerText))]+"...")
 
 	resp, err := this.openaiClient.Chat.Completions.New(context.Background(), req)
 	if err != nil {
@@ -407,18 +468,27 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 		heuristicHeaders := this.getHeuristicHeaders(grid, startRow, maxCol)
 		heuristicSampleRows := this.getHeuristicSampleRows(grid, startRow, maxCol)
 
+		this.log.Info("Starting early cache check with heuristic headers",
+			"sheet", sheet,
+			"heuristicHeadersCount", len(heuristicHeaders),
+			"heuristicSampleRowsCount", len(heuristicSampleRows),
+			"firstFewHeaders", heuristicHeaders[:min(3, len(heuristicHeaders))])
+
 		// Check cache for table validation using heuristic headers
 		if cached, found := this.getCachedTableValidation(heuristicHeaders, heuristicSampleRows); found {
 			this.log.Info("Using cached table validation for early decision",
 				"sheet", sheet,
 				"isProductTable", cached.IsProductTable,
-				"confidence", cached.Confidence)
+				"confidence", cached.Confidence,
+				"reasoning", cached.Reasoning[:min(100, len(cached.Reasoning))]+"...")
 
 			// If cache says it's not a product table with high confidence, skip expensive processing
 			if !cached.IsProductTable && cached.Confidence >= 7 {
 				this.log.Info("Skipping sheet based on cached validation - not a product table", "sheet", sheet)
 				continue
 			}
+		} else {
+			this.log.Info("No early cache hit - proceeding with GPT analysis", "sheet", sheet)
 		}
 
 		// Determine header rows using GPT
@@ -502,6 +572,10 @@ func (this *ExcelParserService) parse(file []byte) ([]*app.ParseExcelResult, err
 					},
 				},
 			}
+
+			this.log.Info("Making GPT API call for header analysis",
+				"rowTextsCount", len(rowTexts),
+				"promptLength", len(prompt))
 
 			resp, err := this.openaiClient.Chat.Completions.New(context.Background(), req)
 			if err != nil {
