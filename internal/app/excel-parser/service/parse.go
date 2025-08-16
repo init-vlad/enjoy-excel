@@ -500,23 +500,6 @@ func min(a, b int) int {
 	return b
 }
 
-// isLikelyAcronym checks if a string looks like an acronym (all caps, short)
-func isLikelyAcronym(s string) bool {
-	if len(s) <= 2 {
-		return false // Too short to be meaningful
-	}
-	if len(s) > 6 {
-		return false // Too long to be typical acronym
-	}
-	// Check if it's all uppercase letters
-	for _, r := range s {
-		if r < 'A' || r > 'Z' {
-			return false
-		}
-	}
-	return true
-}
-
 // scoreHeaderQuality gives a quality score to a potential header string
 // Higher score means better header quality
 func scoreHeaderQuality(header string) int {
