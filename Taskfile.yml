@@ -13,6 +13,15 @@ tasks:
     cmds:
       - GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o build/app cmd/main.go
 
+  run-build:
+    cmds:
+      - ./build/app {{.CFG}}
+
+  rbuild:
+    cmds:
+      - task: build
+      - task: run-build
+
   fresh:
     cmds:
       - go run cmd/automigrate/fresh/main.go {{.CFG}}
