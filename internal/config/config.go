@@ -58,11 +58,23 @@ type MinioConfig struct {
 
 // Clients to external APIs, SDKs
 type Clients struct {
-	OpenAI OpenAIConfig `yaml:"openai"`
+	OpenAI     OpenAIConfig        `yaml:"openai"`
+	Laravel    LaravelClientConfig `yaml:"laravel"`
+	Opensearch OpensearchConfig    `yaml:"opensearch"`
 }
 
 type OpenAIConfig struct {
 	ApiKey string `yaml:"api_key"`
+}
+
+type LaravelClientConfig struct {
+	Url string `yaml:"url"`
+}
+
+type OpensearchConfig struct {
+	Url      string `yaml:"url"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
 }
 
 // Internal microservices or internal modules

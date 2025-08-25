@@ -6,6 +6,7 @@ import (
 	"github.com/init-pkg/nova-template/internal/config"
 	minio_module "github.com/init-pkg/nova-template/internal/infra/minio"
 	redis_module "github.com/init-pkg/nova-template/internal/infra/redis"
+	http_server_module "github.com/init-pkg/nova-template/internal/transports/http"
 
 	nova_kits_init_auth "github.com/init-pkg/nova-kits/init-auth"
 	nova_logger "github.com/init-pkg/nova/lib/logger"
@@ -40,7 +41,7 @@ func coreOptions() fx.Option {
 		minio_module.Register(),
 
 		/* transports */
-		// http_server_module.Register(),
+		http_server_module.Register(),
 		// amqp_module.Register(),
 		// grpc_server_module.Register(),
 
