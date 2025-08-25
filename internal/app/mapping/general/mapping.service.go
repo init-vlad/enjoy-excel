@@ -50,13 +50,12 @@ LARAVEL TODO:
   - реализовать meta поле для товара. GO будет писать туда unknown заголовки для каждого supplier_id {supplier_id: {unknownHeader1: string}} (в конце)
 */
 func (this *Service) MapProductFields(
-	supplierId uint64,
+	supplierId *uint64,
 	r *app.ParseExcelResult,
 	existingSupplierMappings []laravel_client.ProductMappingResponse,
 	existingGeneralMappings []laravel_client.ProductMappingResponse,
 ) (*app.ParseExcelResult, errs.Error) {
 
-	// create skip list
 	skip := make([]string, 0, len(existingSupplierMappings)+len(existingGeneralMappings))
 	for _, m := range existingSupplierMappings {
 		skip = append(skip, m.ExcelHeader)
@@ -71,24 +70,26 @@ func (this *Service) MapProductFields(
 		return nil, errs.WrapAppError(e, &errs.ErrorOpts{})
 	}
 
-	// build create laravel mappings request
-	var mappingsToCreate = make([]laravel_client.ProductMapping, 0, len(result.Mappings))
-	for _, m := range result.Mappings {
-		if !laravel_client.ProductField(m.ProductField).IsValid() {
-			continue
+	// create laravel mappings
+	if len(result.Mappings) > 0 {
+		var mappingsToCreate = make([]laravel_client.ProductMapping, 0, len(result.Mappings))
+		for _, m := range result.Mappings {
+			if !laravel_client.ProductField(m.ProductField).IsValid() {
+				continue
+			}
+
+			mappingsToCreate = append(mappingsToCreate, laravel_client.ProductMapping{
+				ExcelHeader:     m.ExcelHeader,
+				ProductField:    m.ProductField,
+				ConfidenceScore: &m.ConfidenceScore,
+			})
 		}
 
-		mappingsToCreate = append(mappingsToCreate, laravel_client.ProductMapping{
-			ExcelHeader:     m.ExcelHeader,
-			ProductField:    m.ProductField,
-			ConfidenceScore: &m.ConfidenceScore,
-		})
-	}
-
-	var err = this.laravelClient.CreateProductMappings(mappingsToCreate, &supplierId)
-	fmt.Println("Created mappings: ", mappingsToCreate)
-	if err != nil {
-		return nil, err
+		var err = this.laravelClient.CreateProductMappings(mappingsToCreate, supplierId)
+		fmt.Println("Created mappings: ", mappingsToCreate)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// build final mapping

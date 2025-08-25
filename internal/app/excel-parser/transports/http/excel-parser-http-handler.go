@@ -51,14 +51,22 @@ func (this *ExcelParserHttpHandler) manualUpload(fctx fiber.Ctx) error {
 		return errs.WriteError(fctx, err)
 	}
 
-	supMappings, e := this.laravelClient.GetProductMappings(&laravel_client.QueryParams{SupplierID: &req.SupplierId})
-	if e != nil {
-		return errs.WriteError(fctx, e)
+	var supMappings []laravel_client.ProductMappingResponse = nil
+	if req.HasSupplier() {
+		sm, e := this.laravelClient.GetProductMappings(&laravel_client.QueryParams{SupplierID: req.SupplierId})
+		if e != nil {
+			return errs.WriteError(fctx, e)
+		}
+
+		supMappings = sm
 	}
+
 	gMappings, e := this.laravelClient.GetProductMappings(&laravel_client.QueryParams{OnlyGlobal: true})
 	if e != nil {
 		return errs.WriteError(fctx, e)
 	}
+
+	fmt.Println("sm", supMappings)
 
 	fmt.Println("Supplier name: ", req.SupplierName)
 	for _, table := range res {
